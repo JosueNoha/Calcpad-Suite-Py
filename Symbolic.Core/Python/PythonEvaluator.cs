@@ -1,0 +1,1236 @@
+// =============================================================================
+// Calcpad Suite Py — Python Evaluator (tree-walking interpreter)
+// =============================================================================
+//   Ejecuta el AST producido por PythonParser. Soporta un subset amplio de
+//   Python: aritmética, control de flujo, funciones, clases, comprensiones,
+//   f-strings, slicing, builtins comunes y el módulo `math`.
+//   Lo no soportado lanza PythonNotSupported → el pipeline cae a python real.
+// =============================================================================
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+
+namespace Calcpad.Core.Python
+{
+    public sealed class StatementResult
+    {
+        public bool Display;
+        public List<(PyNode Target, object Value)> Assignments;  // assign / augassign
+        public PyNode RhsExpr;   // expresión del lado derecho (para render "x = fórmula = valor")
+        public PyNode Expr;      // expr stmt
+        public object Value;     // valor del expr stmt
+        public bool HasValue;    // expr produjo un valor != None
+    }
+
+    // ── Control de flujo vía excepciones ──
+    internal sealed class BreakSignal : Exception { }
+    internal sealed class ContinueSignal : Exception { }
+    internal sealed class ReturnSignal : Exception { public object Value; }
+    internal sealed class PyRaiseSignal : Exception { public object Value; public PyRaiseSignal(object v) { Value = v; } }
+
+    /// <summary>Método ligado a un objeto (instance.method).</summary>
+    public sealed class PyBoundMethod
+    {
+        public PyFunction Func;
+        public object Self;
+    }
+
+    public sealed class PythonEvaluator
+    {
+        public PyScope Globals { get; }
+        public Action<string> Output { get; set; } = _ => { };
+        public Action<string> HtmlOut { get; set; } = _ => { };
+        private int _vizId;
+
+        private static readonly HashSet<string> NativeModules = new(StringComparer.Ordinal)
+        { "math", "cmath" };
+
+        public PythonEvaluator()
+        {
+            Globals = new PyScope(null, null);
+            RegisterBuiltins();
+        }
+
+        /// <summary>Indica si todos los imports del módulo son satisfacibles nativamente.</summary>
+        public static bool CanRunNatively(List<PyNode> stmts, out string reason)
+        {
+            reason = null;
+            foreach (var s in stmts)
+            {
+                if (!CheckImports(s, ref reason)) return false;
+            }
+            return true;
+        }
+
+        private static bool CheckImports(PyNode s, ref string reason)
+        {
+            switch (s)
+            {
+                case ImportStmt im:
+                    foreach (var (mod, _) in im.Names)
+                    {
+                        var root = mod.Split('.')[0];
+                        if (!NativeModules.Contains(root)) { reason = $"import {mod}"; return false; }
+                    }
+                    return true;
+                case ImportFromStmt fr:
+                    var r = fr.Module.TrimStart('.').Split('.')[0];
+                    if (r.Length > 0 && !NativeModules.Contains(r)) { reason = $"from {fr.Module} import ..."; return false; }
+                    return true;
+                case IfStmt iff:
+                    foreach (var (_, b) in iff.Branches) foreach (var x in b) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                case ForStmt fo:
+                    foreach (var x in fo.Body) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                case WhileStmt wh:
+                    foreach (var x in wh.Body) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                case FuncDef fd:
+                    foreach (var x in fd.Body) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                case ClassDef cd:
+                    foreach (var x in cd.Body) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                case TryStmt tr:
+                    foreach (var x in tr.Body) if (!CheckImports(x, ref reason)) return false;
+                    foreach (var h in tr.Handlers) foreach (var x in h.Body) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                case WithStmt wi:
+                    foreach (var x in wi.Body) if (!CheckImports(x, ref reason)) return false;
+                    return true;
+                default:
+                    return true;
+            }
+        }
+
+        // ===================================================================
+        //  EJECUCIÓN DE STATEMENTS TOP-LEVEL (con StatementResult para render)
+        // ===================================================================
+        public StatementResult ExecuteOne(PyNode stmt, PyScope scope)
+        {
+            switch (stmt)
+            {
+                case AssignStmt a:
+                {
+                    var val = Eval(a.Value, scope);
+                    var assigns = new List<(PyNode, object)>();
+                    foreach (var tgt in a.Targets)
+                    {
+                        AssignTarget(tgt, val, scope);
+                        assigns.Add((tgt, val));
+                    }
+                    return new StatementResult { Display = true, Assignments = assigns, RhsExpr = a.Value };
+                }
+                case AugAssignStmt ag:
+                {
+                    var cur = Eval(ag.Target, scope);
+                    var rhs = Eval(ag.Value, scope);
+                    var nv = PyOps.Binary(ag.Op, cur, rhs);
+                    AssignTarget(ag.Target, nv, scope);
+                    return new StatementResult { Display = true, Assignments = new() { (ag.Target, nv) } };
+                }
+                case ExprStmt e:
+                {
+                    var v = Eval(e.Expr, scope);
+                    // String/f-string literal suelto = TEXTO (como ' o " de Calcpad), se muestra.
+                    if (e.Expr is StringLit || e.Expr is FStringLit)
+                        return new StatementResult { Display = true, Expr = e.Expr, Value = v, HasValue = true };
+                    bool has = v != null;
+                    return new StatementResult { Display = has, Expr = e.Expr, Value = v, HasValue = has };
+                }
+                case CommentStmt:
+                    return new StatementResult { Display = true };
+                default:
+                    ExecStmt(stmt, scope);
+                    return new StatementResult { Display = false };
+            }
+        }
+
+        // ===================================================================
+        //  EJECUCIÓN INTERNA (sin render)
+        // ===================================================================
+        public void ExecBlock(List<PyNode> body, PyScope scope)
+        {
+            foreach (var s in body) ExecStmt(s, scope);
+        }
+
+        private void ExecStmt(PyNode stmt, PyScope scope)
+        {
+            switch (stmt)
+            {
+                case AssignStmt a:
+                {
+                    var val = Eval(a.Value, scope);
+                    foreach (var tgt in a.Targets) AssignTarget(tgt, val, scope);
+                    break;
+                }
+                case AugAssignStmt ag:
+                {
+                    var cur = Eval(ag.Target, scope);
+                    var rhs = Eval(ag.Value, scope);
+                    AssignTarget(ag.Target, PyOps.Binary(ag.Op, cur, rhs), scope);
+                    break;
+                }
+                case ExprStmt e: Eval(e.Expr, scope); break;
+                case CommentStmt: break;
+                case PassStmt: break;
+                case BreakStmt: throw new BreakSignal();
+                case ContinueStmt: throw new ContinueSignal();
+                case ReturnStmt r: throw new ReturnSignal { Value = r.Value == null ? null : Eval(r.Value, scope) };
+                case FuncDef fd: scope.Set(fd.Name, MakeFunction(fd, scope)); break;
+                case ClassDef cd: ExecClassDef(cd, scope); break;
+                case IfStmt iff: ExecIf(iff, scope); break;
+                case ForStmt fo: ExecFor(fo, scope); break;
+                case WhileStmt wh: ExecWhile(wh, scope); break;
+                case TryStmt tr: ExecTry(tr, scope); break;
+                case WithStmt wi: ExecWith(wi, scope); break;
+                case ImportStmt im: ExecImport(im, scope); break;
+                case ImportFromStmt fr: ExecImportFrom(fr, scope); break;
+                case GlobalStmt g:
+                    scope.GlobalNames ??= new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var nm in g.Names) scope.GlobalNames.Add(nm);
+                    break;
+                case NonlocalStmt: break; // tratado como global-ish (MVP)
+                case DelStmt d:
+                    foreach (var t in d.Targets) DelTarget(t, scope);
+                    break;
+                case AssertStmt asrt:
+                    if (!PyOps.Truthy(Eval(asrt.Test, scope)))
+                    {
+                        var m = asrt.Message != null ? PyOps.Str(Eval(asrt.Message, scope)) : "";
+                        throw new PyRuntimeError("AssertionError", m);
+                    }
+                    break;
+                case RaiseStmt rs:
+                    if (rs.Exc == null) throw new PyRuntimeError("RuntimeError", "No active exception to re-raise");
+                    throw new PyRaiseSignal(Eval(rs.Exc, scope));
+                default:
+                    throw new PythonNotSupported($"statement {stmt.GetType().Name}");
+            }
+        }
+
+        private void ExecIf(IfStmt iff, PyScope scope)
+        {
+            foreach (var (cond, body) in iff.Branches)
+            {
+                if (cond == null) { ExecBlock(body, scope); return; }
+                if (PyOps.Truthy(Eval(cond, scope))) { ExecBlock(body, scope); return; }
+            }
+        }
+
+        private void ExecFor(ForStmt fo, PyScope scope)
+        {
+            var iter = Eval(fo.Iter, scope);
+            bool broke = false;
+            foreach (var item in Iterate(iter))
+            {
+                AssignTarget(fo.Target, item, scope);
+                try { ExecBlock(fo.Body, scope); }
+                catch (BreakSignal) { broke = true; break; }
+                catch (ContinueSignal) { }
+            }
+            if (!broke && fo.ElseBody != null) ExecBlock(fo.ElseBody, scope);
+        }
+
+        private void ExecWhile(WhileStmt wh, PyScope scope)
+        {
+            bool broke = false;
+            while (PyOps.Truthy(Eval(wh.Cond, scope)))
+            {
+                try { ExecBlock(wh.Body, scope); }
+                catch (BreakSignal) { broke = true; break; }
+                catch (ContinueSignal) { }
+            }
+            if (!broke && wh.ElseBody != null) ExecBlock(wh.ElseBody, scope);
+        }
+
+        private void ExecTry(TryStmt tr, PyScope scope)
+        {
+            try
+            {
+                ExecBlock(tr.Body, scope);
+                if (tr.ElseBody != null) ExecBlock(tr.ElseBody, scope);
+            }
+            catch (Exception ex) when (ex is PyRuntimeError || ex is PyRaiseSignal)
+            {
+                string excType = ex is PyRuntimeError pre ? pre.PyType : "Exception";
+                object excVal = ex is PyRaiseSignal prs ? prs.Value : null;
+                bool handled = false;
+                foreach (var h in tr.Handlers)
+                {
+                    bool match = h.ExcType == null;
+                    if (!match)
+                    {
+                        var et = Eval(h.ExcType, scope);
+                        string name = et is PyClass pc ? pc.Name : (et is PyBuiltin pb ? pb.Name : PyOps.Str(et));
+                        if (name == excType || name == "Exception" || name == "BaseException") match = true;
+                    }
+                    if (match)
+                    {
+                        if (h.Name != null) scope.Set(h.Name, excVal ?? new PyRuntimeError(excType, ex.Message));
+                        ExecBlock(h.Body, scope);
+                        handled = true;
+                        break;
+                    }
+                }
+                if (!handled) { if (tr.FinallyBody != null) ExecBlock(tr.FinallyBody, scope); throw; }
+            }
+            finally
+            {
+                if (tr.FinallyBody != null) ExecBlock(tr.FinallyBody, scope);
+            }
+        }
+
+        private void ExecWith(WithStmt wi, PyScope scope)
+        {
+            // MVP: evalúa el contexto y ejecuta el cuerpo (sin __enter__/__exit__ reales).
+            foreach (var (ctx, var) in wi.Items)
+            {
+                var v = Eval(ctx, scope);
+                if (var != null) AssignTarget(var, v, scope);
+            }
+            ExecBlock(wi.Body, scope);
+        }
+
+        private void ExecImport(ImportStmt im, PyScope scope)
+        {
+            foreach (var (mod, alias) in im.Names)
+            {
+                var root = mod.Split('.')[0];
+                var m = LoadNativeModule(root);
+                scope.Set(alias ?? root, m);
+            }
+        }
+
+        private void ExecImportFrom(ImportFromStmt fr, PyScope scope)
+        {
+            var root = fr.Module.TrimStart('.').Split('.')[0];
+            var m = LoadNativeModule(root);
+            if (fr.ImportStar)
+            {
+                foreach (var kv in m.Attrs) scope.Set(kv.Key, kv.Value);
+                return;
+            }
+            foreach (var (name, alias) in fr.Names)
+            {
+                if (m.Attrs.TryGetValue(name, out var v)) scope.Set(alias ?? name, v);
+                else throw new PythonNotSupported($"from {fr.Module} import {name}");
+            }
+        }
+
+        private PyModule LoadNativeModule(string name)
+        {
+            if (name == "math" || name == "cmath") return PythonMath.Module;
+            throw new PythonNotSupported($"módulo {name}");
+        }
+
+        private void ExecClassDef(ClassDef cd, PyScope scope)
+        {
+            var cls = new PyClass { Name = cd.Name };
+            foreach (var b in cd.Bases)
+            {
+                var bv = Eval(b, scope);
+                if (bv is PyClass pc) cls.Bases.Add(pc);
+            }
+            var classScope = new PyScope(scope, scope.Globals);
+            foreach (var s in cd.Body)
+            {
+                if (s is FuncDef fd)
+                    cls.Attrs[fd.Name] = MakeFunction(fd, scope, cls);
+                else if (s is AssignStmt a && a.Targets.Count == 1 && a.Targets[0] is NameRef nr)
+                    cls.Attrs[nr.Name] = Eval(a.Value, classScope);
+                else
+                    ExecStmt(s, classScope);
+            }
+            scope.Set(cd.Name, cls);
+        }
+
+        private PyFunction MakeFunction(FuncDef fd, PyScope closure, PyClass owner = null)
+            => new PyFunction { Name = fd.Name, Params = fd.Params, Body = fd.Body, Closure = closure, OwnerClass = owner };
+
+        // ===================================================================
+        //  ASIGNACIÓN A TARGETS
+        // ===================================================================
+        private void AssignTarget(PyNode target, object value, PyScope scope)
+        {
+            switch (target)
+            {
+                case NameRef nr: scope.Set(nr.Name, value); break;
+                case TupleLit tup: UnpackInto(tup.Elements, value, scope); break;
+                case ListLit lst: UnpackInto(lst.Elements, value, scope); break;
+                case IndexExpr ix:
+                {
+                    var obj = Eval(ix.Target, scope);
+                    var idx = Eval(ix.Index, scope);
+                    SetItem(obj, idx, value);
+                    break;
+                }
+                case AttributeExpr at:
+                {
+                    var obj = Eval(at.Target, scope);
+                    SetAttr(obj, at.Name, value);
+                    break;
+                }
+                case StarExpr se: AssignTarget(se.Value, value, scope); break;
+                default:
+                    throw new PythonNotSupported($"target de asignación {target.GetType().Name}");
+            }
+        }
+
+        private void UnpackInto(List<PyNode> targets, object value, PyScope scope)
+        {
+            var items = new List<object>(Iterate(value));
+            int starIdx = targets.FindIndex(t => t is StarExpr);
+            if (starIdx < 0)
+            {
+                if (items.Count != targets.Count)
+                    throw new PyRuntimeError("ValueError", $"not enough values to unpack (expected {targets.Count}, got {items.Count})");
+                for (int i = 0; i < targets.Count; i++) AssignTarget(targets[i], items[i], scope);
+            }
+            else
+            {
+                int after = targets.Count - starIdx - 1;
+                for (int i = 0; i < starIdx; i++) AssignTarget(targets[i], items[i], scope);
+                int starCount = items.Count - starIdx - after;
+                var mid = new PyList();
+                for (int i = 0; i < starCount; i++) mid.Items.Add(items[starIdx + i]);
+                AssignTarget(((StarExpr)targets[starIdx]).Value, mid, scope);
+                for (int i = 0; i < after; i++) AssignTarget(targets[starIdx + 1 + i], items[starIdx + starCount + i], scope);
+            }
+        }
+
+        private void DelTarget(PyNode target, PyScope scope)
+        {
+            switch (target)
+            {
+                case NameRef nr: scope.Vars.Remove(nr.Name); break;
+                case IndexExpr ix:
+                {
+                    var obj = Eval(ix.Target, scope);
+                    var idx = Eval(ix.Index, scope);
+                    if (obj is PyList l) l.Items.RemoveAt(NormIndex(PyOps.ToLong(idx), l.Count));
+                    else if (obj is PyDict d) d.Remove(idx);
+                    else throw new PythonNotSupported("del de este tipo");
+                    break;
+                }
+                default: throw new PythonNotSupported("del target");
+            }
+        }
+
+        // ===================================================================
+        //  EVALUACIÓN DE EXPRESIONES
+        // ===================================================================
+        public object Eval(PyNode node, PyScope scope)
+        {
+            switch (node)
+            {
+                case NumberLit n: return n.IsInt ? (object)(long)n.Value : n.Value;
+                case StringLit s: return s.Value;
+                case BoolLit b: return b.Value;
+                case NoneLit: return null;
+                case FStringLit f: return EvalFString(f, scope);
+                case NameRef nr: return EvalName(nr, scope);
+                case UnaryOp u: return EvalUnary(u, scope);
+                case BinaryOp bin: return EvalBinary(bin, scope);
+                case CompareOp c: return EvalCompare(c, scope);
+                case CallExpr call: return EvalCall(call, scope);
+                case IndexExpr ix: return EvalIndex(ix, scope);
+                case AttributeExpr at: return GetAttr(Eval(at.Target, scope), at.Name);
+                case ListLit l: return EvalList(l, scope);
+                case TupleLit t: return EvalTuple(t, scope);
+                case SetLit st: return EvalSet(st, scope);
+                case DictLit d: return EvalDict(d, scope);
+                case Comprehension comp: return EvalComprehension(comp, scope);
+                case LambdaExpr lam: return new PyFunction { Name = "<lambda>", Params = lam.Params, Expr = lam.Body, Closure = scope };
+                case IfExp ie: return PyOps.Truthy(Eval(ie.Cond, scope)) ? Eval(ie.TrueExpr, scope) : Eval(ie.FalseExpr, scope);
+                case StarExpr se: return Eval(se.Value, scope);
+                default:
+                    throw new PythonNotSupported($"expresión {node.GetType().Name}");
+            }
+        }
+
+        private object EvalName(NameRef nr, PyScope scope)
+        {
+            if (scope.TryGet(nr.Name, out var v)) return v;
+            if (Globals.Vars.TryGetValue(nr.Name, out v)) return v;
+            throw new PyRuntimeError("NameError", $"name '{nr.Name}' is not defined");
+        }
+
+        private object EvalUnary(UnaryOp u, PyScope scope)
+        {
+            var v = Eval(u.Operand, scope);
+            return u.Op switch
+            {
+                "-" => PyOps.Negate(v),
+                "+" => v,
+                "not" => !PyOps.Truthy(v),
+                "~" => ~PyOps.ToLong(v),
+                _ => throw new PythonNotSupported($"unario {u.Op}")
+            };
+        }
+
+        private object EvalBinary(BinaryOp bin, PyScope scope)
+        {
+            if (bin.Op == "and")
+            {
+                var l = Eval(bin.Left, scope);
+                return PyOps.Truthy(l) ? Eval(bin.Right, scope) : l;
+            }
+            if (bin.Op == "or")
+            {
+                var l = Eval(bin.Left, scope);
+                return PyOps.Truthy(l) ? l : Eval(bin.Right, scope);
+            }
+            if (bin.Op == ":=")
+            {
+                var v = Eval(bin.Right, scope);
+                AssignTarget(bin.Left, v, scope);
+                return v;
+            }
+            var a = Eval(bin.Left, scope);
+            var b = Eval(bin.Right, scope);
+            return PyOps.Binary(bin.Op, a, b);
+        }
+
+        private object EvalCompare(CompareOp c, PyScope scope)
+        {
+            var left = Eval(c.Left, scope);
+            for (int i = 0; i < c.Ops.Count; i++)
+            {
+                var right = Eval(c.Comparators[i], scope);
+                if (!CompareOnce(c.Ops[i], left, right)) return false;
+                left = right;
+            }
+            return true;
+        }
+
+        private bool CompareOnce(string op, object a, object b)
+        {
+            switch (op)
+            {
+                case "==": return PyOps.Equal(a, b);
+                case "!=": return !PyOps.Equal(a, b);
+                case "<": return PyOps.Compare(a, b) < 0;
+                case ">": return PyOps.Compare(a, b) > 0;
+                case "<=": return PyOps.Compare(a, b) <= 0;
+                case ">=": return PyOps.Compare(a, b) >= 0;
+                case "is": return ReferenceEquals(a, b) || (a == null && b == null) || (PyOps.IsNumber(a) && PyOps.IsNumber(b) && PyOps.Equal(a, b) && a.GetType() == b.GetType());
+                case "is not": return !CompareOnce("is", a, b);
+                case "in": return Contains(b, a);
+                case "not in": return !Contains(b, a);
+                default: throw new PythonNotSupported($"comparador {op}");
+            }
+        }
+
+        private bool Contains(object container, object item)
+        {
+            switch (container)
+            {
+                case string s when item is string sub: return s.Contains(sub);
+                case PyDict d: return d.ContainsKey(item);
+                case PySet st: return st.Contains(item);
+                default:
+                    foreach (var x in Iterate(container)) if (PyOps.Equal(x, item)) return true;
+                    return false;
+            }
+        }
+
+        private object EvalIndex(IndexExpr ix, PyScope scope)
+        {
+            var obj = Eval(ix.Target, scope);
+            if (ix.Index is SliceExpr sl) return GetSlice(obj, sl, scope);
+            var idx = Eval(ix.Index, scope);
+            return GetItem(obj, idx);
+        }
+
+        private object EvalList(ListLit l, PyScope scope)
+        {
+            var r = new PyList();
+            foreach (var e in l.Elements)
+            {
+                if (e is StarExpr se) foreach (var x in Iterate(Eval(se.Value, scope))) r.Items.Add(x);
+                else r.Items.Add(Eval(e, scope));
+            }
+            return r;
+        }
+        private object EvalTuple(TupleLit t, PyScope scope)
+        {
+            var r = new List<object>();
+            foreach (var e in t.Elements)
+            {
+                if (e is StarExpr se) foreach (var x in Iterate(Eval(se.Value, scope))) r.Add(x);
+                else r.Add(Eval(e, scope));
+            }
+            return new PyTuple(r);
+        }
+        private object EvalSet(SetLit st, PyScope scope)
+        {
+            var r = new PySet();
+            foreach (var e in st.Elements) r.Add(Eval(e, scope));
+            return r;
+        }
+        private object EvalDict(DictLit d, PyScope scope)
+        {
+            var r = new PyDict();
+            foreach (var (k, v) in d.Pairs)
+            {
+                if (k == null) // **unpack
+                {
+                    if (Eval(v, scope) is PyDict src)
+                        for (int i = 0; i < src.Keys.Count; i++) r.Set(src.Keys[i], src.Values[i]);
+                    continue;
+                }
+                r.Set(Eval(k, scope), Eval(v, scope));
+            }
+            return r;
+        }
+
+        private object EvalComprehension(Comprehension comp, PyScope scope)
+        {
+            var result = comp.Kind switch
+            {
+                "list" or "gen" => (object)new PyList(),
+                "set" => new PySet(),
+                "dict" => new PyDict(),
+                _ => new PyList()
+            };
+            var inner = new PyScope(scope, scope.Globals);
+            RunCompClauses(comp, 0, inner, result);
+            return result;
+        }
+
+        private void RunCompClauses(Comprehension comp, int ci, PyScope scope, object result)
+        {
+            if (ci >= comp.Clauses.Count)
+            {
+                switch (result)
+                {
+                    case PyList l: l.Items.Add(Eval(comp.Element, scope)); break;
+                    case PySet s: s.Add(Eval(comp.Element, scope)); break;
+                    case PyDict d: d.Set(Eval(comp.Element, scope), Eval(comp.ValueElement, scope)); break;
+                }
+                return;
+            }
+            var clause = comp.Clauses[ci];
+            foreach (var item in Iterate(Eval(clause.Iter, scope)))
+            {
+                AssignTarget(clause.Target, item, scope);
+                bool ok = true;
+                foreach (var cond in clause.Conditions) if (!PyOps.Truthy(Eval(cond, scope))) { ok = false; break; }
+                if (ok) RunCompClauses(comp, ci + 1, scope, result);
+            }
+        }
+
+        private string EvalFString(FStringLit f, PyScope scope)
+        {
+            var sb = new StringBuilder();
+            foreach (var part in f.Parts)
+            {
+                if (part.Expr != null)
+                {
+                    var v = Eval(part.Expr, scope);
+                    string s = part.Repr ? PyOps.Repr(v)
+                             : !string.IsNullOrEmpty(part.FormatSpec) ? PyStringFormat.FormatSpec(v, ResolveSpec(part.FormatSpec, scope))
+                             : PyOps.Str(v);
+                    sb.Append(s);
+                }
+                else sb.Append(part.Text);
+            }
+            return sb.ToString();
+        }
+
+        // format-spec puede contener {expr} anidados (ej. {x:.{n}f})
+        private string ResolveSpec(string spec, PyScope scope)
+        {
+            if (spec.IndexOf('{') < 0) return spec;
+            var sb = new StringBuilder();
+            for (int i = 0; i < spec.Length; i++)
+            {
+                if (spec[i] == '{')
+                {
+                    int j = spec.IndexOf('}', i);
+                    if (j < 0) { sb.Append(spec.Substring(i)); break; }
+                    var inner = spec.Substring(i + 1, j - i - 1);
+                    var toks = PythonTokenizer.Tokenize(inner);
+                    var v = new PythonParser(toks).ParseExpr();
+                    sb.Append(PyOps.Str(Eval(v, scope)));
+                    i = j;
+                }
+                else sb.Append(spec[i]);
+            }
+            return sb.ToString();
+        }
+
+        // ===================================================================
+        //  LLAMADAS A FUNCIÓN
+        // ===================================================================
+        private object EvalCall(CallExpr call, PyScope scope)
+        {
+            var func = Eval(call.Func, scope);
+            var args = new List<object>();
+            foreach (var a in call.Args)
+            {
+                if (a is StarExpr se) foreach (var x in Iterate(Eval(se.Value, scope))) args.Add(x);
+                else args.Add(Eval(a, scope));
+            }
+            PyDict kwargs = null;
+            if (call.Kwargs.Count > 0 || call.DoubleStar != null)
+            {
+                kwargs = new PyDict();
+                foreach (var (name, val) in call.Kwargs) kwargs.Set(name, Eval(val, scope));
+                if (call.DoubleStar != null && Eval(call.DoubleStar, scope) is PyDict dd)
+                    for (int i = 0; i < dd.Keys.Count; i++) kwargs.Set(dd.Keys[i], dd.Values[i]);
+            }
+            if (call.StarArgs != null)
+                foreach (var x in Iterate(Eval(call.StarArgs, scope))) args.Add(x);
+            return CallCallable(func, args.ToArray(), kwargs);
+        }
+
+        public object CallCallable(object func, object[] args, PyDict kwargs)
+        {
+            switch (func)
+            {
+                case PyBuiltin b:
+                {
+                    if (b.Self != null)
+                    {
+                        var arr = new object[args.Length + 1];
+                        arr[0] = b.Self;
+                        Array.Copy(args, 0, arr, 1, args.Length);
+                        return b.Invoke(arr, kwargs);
+                    }
+                    return b.Invoke(args, kwargs);
+                }
+                case PyFunction f: return CallUserFunc(f, null, args, kwargs);
+                case PyBoundMethod bm:
+                {
+                    var arr = new object[args.Length + 1];
+                    arr[0] = bm.Self;
+                    Array.Copy(args, 0, arr, 1, args.Length);
+                    return CallUserFunc(bm.Func, null, arr, kwargs);
+                }
+                case PyClass cls: return Instantiate(cls, args, kwargs);
+                default:
+                    throw new PyRuntimeError("TypeError", $"'{PyOps.TypeName(func)}' object is not callable");
+            }
+        }
+
+        private object CallUserFunc(PyFunction f, object self, object[] args, PyDict kwargs)
+        {
+            var local = new PyScope(f.Closure, f.Closure?.Globals ?? Globals);
+            // Bind parámetros
+            int ai = 0;
+            var assigned = new HashSet<string>(StringComparer.Ordinal);
+            for (int pi = 0; pi < f.Params.Count; pi++)
+            {
+                var p = f.Params[pi];
+                if (p.IsStar)
+                {
+                    var rest = new List<object>();
+                    while (ai < args.Length) rest.Add(args[ai++]);
+                    local.Vars[p.Name] = new PyTuple(rest);
+                    assigned.Add(p.Name);
+                }
+                else if (p.IsDoubleStar)
+                {
+                    var dd = new PyDict();
+                    if (kwargs != null) { for (int i = 0; i < kwargs.Keys.Count; i++) dd.Set(kwargs.Keys[i], kwargs.Values[i]); kwargs = null; }
+                    local.Vars[p.Name] = dd;
+                    assigned.Add(p.Name);
+                }
+                else if (ai < args.Length)
+                {
+                    local.Vars[p.Name] = args[ai++];
+                    assigned.Add(p.Name);
+                }
+                else if (kwargs != null && kwargs.TryGet(p.Name, out var kv))
+                {
+                    local.Vars[p.Name] = kv;
+                    kwargs.Remove(p.Name);
+                    assigned.Add(p.Name);
+                }
+                else if (p.Default != null)
+                {
+                    local.Vars[p.Name] = Eval(p.Default, f.Closure);
+                    assigned.Add(p.Name);
+                }
+                else
+                    throw new PyRuntimeError("TypeError", $"{f.Name}() missing required argument: '{p.Name}'");
+            }
+            // kwargs sobrantes que matcheen params por nombre ya consumidos arriba
+            if (kwargs != null)
+            {
+                for (int i = 0; i < kwargs.Keys.Count; i++)
+                {
+                    var kn = PyOps.Str(kwargs.Keys[i]);
+                    if (!assigned.Contains(kn)) local.Vars[kn] = kwargs.Values[i];
+                }
+            }
+
+            if (f.Expr != null) return Eval(f.Expr, local);
+            try { ExecBlock(f.Body, local); }
+            catch (ReturnSignal rs) { return rs.Value; }
+            return null;
+        }
+
+        private object Instantiate(PyClass cls, object[] args, PyDict kwargs)
+        {
+            var inst = new PyInstance { Class = cls };
+            if (cls.TryLookup("__init__", out var initObj) && initObj is PyFunction init)
+            {
+                var arr = new object[args.Length + 1];
+                arr[0] = inst;
+                Array.Copy(args, 0, arr, 1, args.Length);
+                CallUserFunc(init, null, arr, kwargs);
+            }
+            return inst;
+        }
+
+        // ===================================================================
+        //  ITERACIÓN / INDEXING / SLICING
+        // ===================================================================
+        public IEnumerable<object> Iterate(object o)
+        {
+            switch (o)
+            {
+                case PyList l: foreach (var x in l.Items) yield return x; break;
+                case PyTuple t: foreach (var x in t.Items) yield return x; break;
+                case PySet s: foreach (var x in s.Items) yield return x; break;
+                case PyRange r: foreach (var x in r) yield return x; break;
+                case string str: foreach (var ch in str) yield return ch.ToString(); break;
+                case PyDict d: foreach (var k in d.Keys) yield return k; break;
+                case IEnumerable<object> en: foreach (var x in en) yield return x; break;
+                case null: throw new PyRuntimeError("TypeError", "'NoneType' object is not iterable");
+                default: throw new PyRuntimeError("TypeError", $"'{PyOps.TypeName(o)}' object is not iterable");
+            }
+        }
+
+        public static int NormIndex(long idx, int len)
+        {
+            long i = idx < 0 ? len + idx : idx;
+            if (i < 0 || i >= len) throw new PyRuntimeError("IndexError", "index out of range");
+            return (int)i;
+        }
+
+        private object GetItem(object obj, object idx)
+        {
+            switch (obj)
+            {
+                case PyList l: return l.Items[NormIndex(PyOps.ToLong(idx), l.Count)];
+                case PyTuple t: return t.Items[NormIndex(PyOps.ToLong(idx), t.Count)];
+                case string s: { int i = NormIndex(PyOps.ToLong(idx), s.Length); return s[i].ToString(); }
+                case PyDict d:
+                    if (d.TryGet(idx, out var v)) return v;
+                    throw new PyRuntimeError("KeyError", PyOps.Repr(idx));
+                case PyRange r:
+                {
+                    var items = new List<object>(r);
+                    return items[NormIndex(PyOps.ToLong(idx), items.Count)];
+                }
+                default: throw new PyRuntimeError("TypeError", $"'{PyOps.TypeName(obj)}' object is not subscriptable");
+            }
+        }
+
+        private void SetItem(object obj, object idx, object value)
+        {
+            switch (obj)
+            {
+                case PyList l: l.Items[NormIndex(PyOps.ToLong(idx), l.Count)] = value; break;
+                case PyDict d: d.Set(idx, value); break;
+                default: throw new PyRuntimeError("TypeError", $"'{PyOps.TypeName(obj)}' object does not support item assignment");
+            }
+        }
+
+        private object GetSlice(object obj, SliceExpr sl, PyScope scope)
+        {
+            long? lo = sl.Lower == null ? null : PyOps.ToLong(Eval(sl.Lower, scope));
+            long? hi = sl.Upper == null ? null : PyOps.ToLong(Eval(sl.Upper, scope));
+            long step = sl.Step == null ? 1 : PyOps.ToLong(Eval(sl.Step, scope));
+            if (step == 0) throw new PyRuntimeError("ValueError", "slice step cannot be zero");
+
+            if (obj is string str)
+            {
+                var chars = SliceList(new List<object>(StrChars(str)), lo, hi, step);
+                var sb = new StringBuilder();
+                foreach (var c in chars) sb.Append((string)c);
+                return sb.ToString();
+            }
+            if (obj is PyList l) return new PyList(SliceList(l.Items, lo, hi, step));
+            if (obj is PyTuple t) return new PyTuple(SliceList(t.Items, lo, hi, step));
+            if (obj is PyRange r) return new PyList(SliceList(new List<object>(r), lo, hi, step));
+            throw new PyRuntimeError("TypeError", $"'{PyOps.TypeName(obj)}' no soporta slicing");
+        }
+
+        private static IEnumerable<object> StrChars(string s) { foreach (var c in s) yield return c.ToString(); }
+
+        private static List<object> SliceList(List<object> items, long? lo, long? hi, long step)
+        {
+            int n = items.Count;
+            int start, stop;
+            if (step > 0)
+            {
+                start = (int)Clamp(lo ?? 0, n, false);
+                stop = (int)Clamp(hi ?? n, n, false);
+            }
+            else
+            {
+                start = (int)Clamp(lo ?? (n - 1), n, true);
+                stop = (int)Clamp(hi ?? (-n - 1), n, true);
+            }
+            var res = new List<object>();
+            if (step > 0) for (int i = start; i < stop; i += (int)step) { if (i >= 0 && i < n) res.Add(items[i]); }
+            else for (int i = start; i > stop; i += (int)step) { if (i >= 0 && i < n) res.Add(items[i]); }
+            return res;
+        }
+
+        private static long Clamp(long idx, int n, bool neg)
+        {
+            long i = idx < 0 ? n + idx : idx;
+            if (neg) { if (i < -1) i = -1; if (i > n - 1) i = n - 1; }
+            else { if (i < 0) i = 0; if (i > n) i = n; }
+            return i;
+        }
+
+        // ===================================================================
+        //  ATRIBUTOS Y MÉTODOS
+        // ===================================================================
+        public object GetAttr(object obj, string name)
+        {
+            switch (obj)
+            {
+                case PyModule m:
+                    if (m.Attrs.TryGetValue(name, out var mv)) return mv;
+                    throw new PyRuntimeError("AttributeError", $"module '{m.Name}' has no attribute '{name}'");
+                case PyInstance inst:
+                {
+                    if (inst.Attrs.TryGetValue(name, out var iv)) return iv;
+                    if (inst.Class != null && inst.Class.TryLookup(name, out var cv))
+                    {
+                        if (cv is PyFunction pf) return new PyBoundMethod { Func = pf, Self = inst };
+                        return cv;
+                    }
+                    throw new PyRuntimeError("AttributeError", $"'{inst.Class?.Name}' object has no attribute '{name}'");
+                }
+                case PyClass cls:
+                    if (cls.TryLookup(name, out var clv)) return clv;
+                    throw new PyRuntimeError("AttributeError", $"type object '{cls.Name}' has no attribute '{name}'");
+                case PyRuntimeError err:
+                    if (name == "args") return new PyTuple(new List<object> { err.Message });
+                    return err.Message;
+            }
+            // Métodos builtin de tipos nativos
+            var method = PythonBuiltinMethods.GetMethod(obj, name, this);
+            if (method != null) return method;
+            throw new PyRuntimeError("AttributeError", $"'{PyOps.TypeName(obj)}' object has no attribute '{name}'");
+        }
+
+        private void SetAttr(object obj, string name, object value)
+        {
+            switch (obj)
+            {
+                case PyInstance inst: inst.Attrs[name] = value; break;
+                case PyClass cls: cls.Attrs[name] = value; break;
+                case PyModule m: m.Attrs[name] = value; break;
+                default: throw new PyRuntimeError("AttributeError", $"no se puede asignar atributo a {PyOps.TypeName(obj)}");
+            }
+        }
+
+        // ===================================================================
+        //  BUILTINS
+        // ===================================================================
+        private void RegisterBuiltins()
+        {
+            void Reg(string name, Func<object[], PyDict, object> fn) => Globals.Vars[name] = new PyBuiltin(name, fn);
+
+            Reg("print", (a, kw) =>
+            {
+                string sep = " ", end = "\n";
+                if (kw != null)
+                {
+                    if (kw.TryGet("sep", out var s) && s != null) sep = PyOps.Str(s);
+                    if (kw.TryGet("end", out var e) && e != null) end = PyOps.Str(e);
+                }
+                var sb = new StringBuilder();
+                for (int i = 0; i < a.Length; i++) { if (i > 0) sb.Append(sep); sb.Append(PyOps.Str(a[i])); }
+                sb.Append(end);
+                Output(sb.ToString());
+                return null;
+            });
+            // mesh3d(w, Mxy, Mx, My, a=6, b=6, H=4): visor interactivo de la mesa
+            // (2D canvas jet + crosshair, 3D three.js de la mesa deformada + hover).
+            // Builtin nativo de Calcpad-Py: se llama como funcion Python; el JS vive en el motor.
+            Reg("mesh3d", (a, kw) =>
+            {
+                if (a.Length < 4)
+                    throw new PyRuntimeError("TypeError", "mesh3d(w, Mxy, Mx, My, a=6, b=6, H=4)");
+                double KwD(string k, double d) =>
+                    (kw != null && kw.TryGet(k, out var v) && v != null) ? PyOps.ToDouble(v) : d;
+                (double[] f, int r, int c) Flat(object o, string nm)
+                {
+                    if (o is not PyList pl || pl.Items.Count == 0 || pl.Items[0] is not PyList)
+                        throw new PyRuntimeError("TypeError", $"mesh3d: '{nm}' debe ser una matriz (lista de listas)");
+                    int R = pl.Items.Count, C = ((PyList)pl.Items[0]).Items.Count;
+                    var fa = new double[R * C];
+                    for (int i = 0; i < R; i++)
+                    {
+                        var row = ((PyList)pl.Items[i]).Items;
+                        for (int j = 0; j < C; j++) fa[i * C + j] = PyOps.ToDouble(row[j]);
+                    }
+                    return (fa, R, C);
+                }
+                var (w, R, C) = Flat(a[0], "w");
+                var (mxy, _, _) = Flat(a[1], "Mxy");
+                var (mx, _, _) = Flat(a[2], "Mx");
+                var (my, _, _) = Flat(a[3], "My");
+                string html = PythonViz.MesaViewer(w, mxy, mx, my, R - 1, C - 1,
+                    KwD("a", 6), KwD("b", 6), KwD("H", 4), "rv" + (++_vizId));
+                HtmlOut(html);
+                return null;
+            });
+            // mesh_viewer(nodes, elements, fields, title=""): visor FEM GENÉRICO interactivo.
+            // nodes=lista de [x,y]; elements=lista de [i,j,k(,l)] (tri o quad);
+            // fields=dict nombre->lista de valores nodales. Heatmap jet + HOVER (valor en
+            // el cursor) + selector de campo. Builtin nativo → WebView2 (sin python real).
+            Reg("mesh_viewer", (a, kw) =>
+            {
+                if (a.Length < 3)
+                    throw new PyRuntimeError("TypeError", "mesh_viewer(nodes, elements, fields, title='')");
+                var nl = (PyList)a[0];
+                var nodes = new double[nl.Count][];
+                for (int i = 0; i < nodes.Length; i++)
+                {
+                    var p = (PyList)nl.Items[i];
+                    nodes[i] = new[] { PyOps.ToDouble(p.Items[0]), PyOps.ToDouble(p.Items[1]) };
+                }
+                var el = (PyList)a[1];
+                var tris = new List<int[]>();
+                foreach (var eo in el.Items)
+                {
+                    var e = (PyList)eo;
+                    var ix = new int[e.Count];
+                    for (int k = 0; k < ix.Length; k++) ix[k] = (int)PyOps.ToLong(e.Items[k]);
+                    if (ix.Length >= 4) { tris.Add(new[] { ix[0], ix[1], ix[2] }); tris.Add(new[] { ix[0], ix[2], ix[3] }); }
+                    else if (ix.Length == 3) tris.Add(new[] { ix[0], ix[1], ix[2] });
+                }
+                var fd = (PyDict)a[2];
+                var names = new string[fd.Count];
+                var vals = new double[fd.Count][];
+                for (int i = 0; i < fd.Count; i++)
+                {
+                    names[i] = PyOps.Str(fd.Keys[i]);
+                    var vl = (PyList)fd.Values[i];
+                    var va = new double[vl.Count];
+                    for (int k = 0; k < va.Length; k++) va[k] = PyOps.ToDouble(vl.Items[k]);
+                    vals[i] = va;
+                }
+                string title = a.Length >= 4 ? PyOps.Str(a[3]) : "Campo FEM";
+                string html = PythonViz.MeshViewer(nodes, tris.ToArray(), names, vals, title, "mv" + (++_vizId));
+                HtmlOut(html);
+                return null;
+            });
+            Reg("len", (a, kw) => (long)PyLen(a[0]));
+            Reg("range", (a, kw) =>
+            {
+                long start = 0, stop, step = 1;
+                if (a.Length == 1) stop = PyOps.ToLong(a[0]);
+                else { start = PyOps.ToLong(a[0]); stop = PyOps.ToLong(a[1]); if (a.Length >= 3) step = PyOps.ToLong(a[2]); }
+                return new PyRange(start, stop, step);
+            });
+            Reg("abs", (a, kw) => a[0] is double d ? Math.Abs(d) : (object)Math.Abs(PyOps.ToLong(a[0])));
+            Reg("min", (a, kw) => MinMax(a, kw, true));
+            Reg("max", (a, kw) => MinMax(a, kw, false));
+            Reg("sum", (a, kw) =>
+            {
+                object acc = a.Length > 1 ? a[1] : (object)0L;
+                foreach (var x in Iterate(a[0])) acc = PyOps.Binary("+", acc, x);
+                return acc;
+            });
+            Reg("round", (a, kw) =>
+            {
+                double d = PyOps.ToDouble(a[0]);
+                if (a.Length >= 2 && a[1] != null)
+                {
+                    int nd = (int)PyOps.ToLong(a[1]);
+                    return Math.Round(d, nd, MidpointRounding.ToEven);
+                }
+                return (long)Math.Round(d, MidpointRounding.ToEven);
+            });
+            Reg("int", (a, kw) =>
+            {
+                if (a.Length == 0) return 0L;
+                if (a[0] is string s)
+                {
+                    int bas = a.Length >= 2 ? (int)PyOps.ToLong(a[1]) : 10;
+                    return Convert.ToInt64(s.Trim(), bas);
+                }
+                return PyOps.ToLong(a[0] is double dd ? (object)Math.Truncate(dd) : a[0]);
+            });
+            Reg("float", (a, kw) => a.Length == 0 ? 0.0 : (a[0] is string s ? double.Parse(s.Trim(), CultureInfo.InvariantCulture) : PyOps.ToDouble(a[0])));
+            Reg("str", (a, kw) => a.Length == 0 ? "" : PyOps.Str(a[0]));
+            Reg("repr", (a, kw) => PyOps.Repr(a[0]));
+            Reg("bool", (a, kw) => a.Length != 0 && PyOps.Truthy(a[0]));
+            Reg("list", (a, kw) => a.Length == 0 ? new PyList() : new PyList(Iterate(a[0])));
+            Reg("tuple", (a, kw) => a.Length == 0 ? new PyTuple() : new PyTuple(Iterate(a[0])));
+            Reg("set", (a, kw) => { var s = new PySet(); if (a.Length > 0) foreach (var x in Iterate(a[0])) s.Add(x); return s; });
+            Reg("dict", (a, kw) =>
+            {
+                var d = new PyDict();
+                if (a.Length > 0) foreach (var pair in Iterate(a[0])) { var it = new List<object>(Iterate(pair)); d.Set(it[0], it[1]); }
+                if (kw != null) for (int i = 0; i < kw.Keys.Count; i++) d.Set(kw.Keys[i], kw.Values[i]);
+                return d;
+            });
+            Reg("sorted", (a, kw) =>
+            {
+                var items = new List<object>(Iterate(a[0]));
+                bool rev = kw != null && kw.TryGet("reverse", out var rv) && PyOps.Truthy(rv);
+                object keyFn = null; kw?.TryGet("key", out keyFn);
+                items.Sort((x, y) =>
+                {
+                    object kx = keyFn != null ? CallCallable(keyFn, new[] { x }, null) : x;
+                    object ky = keyFn != null ? CallCallable(keyFn, new[] { y }, null) : y;
+                    return PyOps.Compare(kx, ky);
+                });
+                if (rev) items.Reverse();
+                return new PyList(items);
+            });
+            Reg("reversed", (a, kw) => { var items = new List<object>(Iterate(a[0])); items.Reverse(); return new PyList(items); });
+            Reg("enumerate", (a, kw) =>
+            {
+                long start = a.Length >= 2 ? PyOps.ToLong(a[1]) : 0;
+                var r = new PyList();
+                long i = start;
+                foreach (var x in Iterate(a[0])) r.Items.Add(new PyTuple(new List<object> { i++, x }));
+                return r;
+            });
+            Reg("zip", (a, kw) =>
+            {
+                var iters = new List<List<object>>();
+                foreach (var it in a) iters.Add(new List<object>(Iterate(it)));
+                var r = new PyList();
+                if (iters.Count == 0) return r;
+                int min = int.MaxValue;
+                foreach (var it in iters) min = Math.Min(min, it.Count);
+                for (int i = 0; i < min; i++)
+                {
+                    var tup = new List<object>();
+                    foreach (var it in iters) tup.Add(it[i]);
+                    r.Items.Add(new PyTuple(tup));
+                }
+                return r;
+            });
+            Reg("map", (a, kw) =>
+            {
+                var fn = a[0];
+                var iters = new List<List<object>>();
+                for (int i = 1; i < a.Length; i++) iters.Add(new List<object>(Iterate(a[i])));
+                var r = new PyList();
+                int min = int.MaxValue;
+                foreach (var it in iters) min = Math.Min(min, it.Count);
+                for (int i = 0; i < min; i++)
+                {
+                    var ar = new object[iters.Count];
+                    for (int k = 0; k < iters.Count; k++) ar[k] = iters[k][i];
+                    r.Items.Add(CallCallable(fn, ar, null));
+                }
+                return r;
+            });
+            Reg("filter", (a, kw) =>
+            {
+                var fn = a[0];
+                var r = new PyList();
+                foreach (var x in Iterate(a[1]))
+                {
+                    bool keep = fn == null ? PyOps.Truthy(x) : PyOps.Truthy(CallCallable(fn, new[] { x }, null));
+                    if (keep) r.Items.Add(x);
+                }
+                return r;
+            });
+            Reg("any", (a, kw) => { foreach (var x in Iterate(a[0])) if (PyOps.Truthy(x)) return true; return false; });
+            Reg("all", (a, kw) => { foreach (var x in Iterate(a[0])) if (!PyOps.Truthy(x)) return false; return true; });
+            Reg("type", (a, kw) => PyOps.TypeName(a[0]));
+            Reg("isinstance", (a, kw) => IsInstance(a[0], a[1]));
+            Reg("abs", (a, kw) => a[0] is double d ? Math.Abs(d) : (object)Math.Abs(PyOps.ToLong(a[0])));
+            Reg("ord", (a, kw) => (long)((string)a[0])[0]);
+            Reg("chr", (a, kw) => ((char)PyOps.ToLong(a[0])).ToString());
+            Reg("divmod", (a, kw) => new PyTuple(new List<object> { PyOps.Binary("//", a[0], a[1]), PyOps.Binary("%", a[0], a[1]) }));
+            Reg("pow", (a, kw) => a.Length >= 3 ? PyOps.Binary("%", PyOps.Binary("**", a[0], a[1]), a[2]) : PyOps.Binary("**", a[0], a[1]));
+            Reg("format", (a, kw) => PyStringFormat.FormatSpec(a[0], a.Length >= 2 ? PyOps.Str(a[1]) : ""));
+            Reg("input", (a, kw) => { if (a.Length > 0) Output(PyOps.Str(a[0])); return ""; });
+            Reg("hex", (a, kw) => "0x" + PyOps.ToLong(a[0]).ToString("x"));
+            Reg("oct", (a, kw) => "0o" + Convert.ToString(PyOps.ToLong(a[0]), 8));
+            Reg("bin", (a, kw) => "0b" + Convert.ToString(PyOps.ToLong(a[0]), 2));
+            Reg("isinstance", (a, kw) => IsInstance(a[0], a[1]));
+            Globals.Vars["True"] = true;
+            Globals.Vars["False"] = false;
+            Globals.Vars["None"] = null;
+        }
+
+        private bool IsInstance(object obj, object cls)
+        {
+            string want = cls switch
+            {
+                PyClass pc => pc.Name,
+                PyBuiltin pb => pb.Name,
+                string s => s,
+                PyTuple t => null,
+                _ => PyOps.TypeName(cls)
+            };
+            if (cls is PyTuple tup)
+            {
+                foreach (var c in tup.Items) if (IsInstance(obj, c)) return true;
+                return false;
+            }
+            if (obj is PyInstance inst)
+            {
+                var c = inst.Class;
+                while (c != null) { if (c.Name == want) return true; c = c.Bases.Count > 0 ? c.Bases[0] : null; }
+                return cls is PyClass pcc && inst.Class != null && InheritsFrom(inst.Class, pcc);
+            }
+            string actual = PyOps.TypeName(obj);
+            if (want == "int") return obj is long || obj is bool;
+            if (want == "float") return obj is double;
+            if (want == "number") return PyOps.IsNumber(obj);
+            return actual == want;
+        }
+
+        private bool InheritsFrom(PyClass c, PyClass target)
+        {
+            if (c == target) return true;
+            foreach (var b in c.Bases) if (InheritsFrom(b, target)) return true;
+            return false;
+        }
+
+        private object MinMax(object[] a, PyDict kw, bool min)
+        {
+            IEnumerable<object> seq = a.Length == 1 ? Iterate(a[0]) : a;
+            object keyFn = null; kw?.TryGet("key", out keyFn);
+            object best = null, bestKey = null; bool first = true;
+            foreach (var x in seq)
+            {
+                object k = keyFn != null ? CallCallable(keyFn, new[] { x }, null) : x;
+                if (first || (min ? PyOps.Compare(k, bestKey) < 0 : PyOps.Compare(k, bestKey) > 0))
+                { best = x; bestKey = k; first = false; }
+            }
+            if (first)
+            {
+                if (kw != null && kw.TryGet("default", out var def)) return def;
+                throw new PyRuntimeError("ValueError", $"{(min ? "min" : "max")}() arg is an empty sequence");
+            }
+            return best;
+        }
+
+        public int PyLen(object o) => o switch
+        {
+            string s => s.Length,
+            PyList l => l.Count,
+            PyTuple t => t.Count,
+            PyDict d => d.Count,
+            PySet st => st.Count,
+            PyRange r => (int)r.Length,
+            _ => throw new PyRuntimeError("TypeError", $"object of type '{PyOps.TypeName(o)}' has no len()")
+        };
+    }
+}
