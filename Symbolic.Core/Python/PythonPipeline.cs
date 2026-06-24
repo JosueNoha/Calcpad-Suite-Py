@@ -197,9 +197,38 @@ namespace Calcpad.Core.Python
         // ===================================================================
         //  FALLBACK: PYTHON REAL (subprocess)
         // ===================================================================
+        // Detecta scripts de INTERFAZ GRÁFICA (PyQt5/6, PySide2/6, PyVista, tkinter mainloop).
+        // Estos abren su propia ventana nativa y bloquean en exec_()/mainloop(): se lanzan
+        // DESACOPLADOS (sin timeout, sin capturar stdout) para que la interfaz se vea, igual
+        // que al correr `python script.py` a mano.
+        private static bool IsGuiScript(string source)
+        {
+            string[] markers = {
+                "PyQt5", "PyQt6", "PySide2", "PySide6", "pyvistaqt", "QtInteractor",
+                ".exec_()", ".exec()", ".mainloop(", "QApplication", "pyvista", "vedo",
+                "mayavi", "glfw", "pyglet"
+            };
+            foreach (var m in markers)
+                if (source.Contains(m, StringComparison.Ordinal)) return true;
+            return false;
+        }
+
         private string FinishRealPython(string source)
         {
             LastRanWithRealPython = true;
+
+            // ── INTERFAZ GRÁFICA (Qt/PyVista/tk): abrir ventana nativa desacoplada ──
+            if (IsGuiScript(source))
+            {
+                var (info, okGui) = RealPython.ExecuteDetached(source);
+                var cls = okGui ? "line" : "err";
+                var html = $"<p class=\"{cls}\"><span class=\"eq\"><span style=\"white-space:pre-wrap\">" +
+                           WebUtility.HtmlEncode(info) + "</span></span></p>\n";
+                ScriptFinished?.Invoke(html);
+                if (StreamingMode && StatementCompleted != null) StatementCompleted.Invoke(0, html);
+                return html;
+            }
+
             var instrumented = InstrumentForRender(source);
 
             // STREAMING (WPF): el subproceso de Python transmite su stdout LÍNEA POR LÍNEA
@@ -252,9 +281,12 @@ namespace Calcpad.Core.Python
             if (ln.StartsWith(ImgMarker, StringComparison.Ordinal))
             {
                 var b64 = ln.Substring(ImgMarker.Length).Trim();
-                return b64.Length == 0 ? "" :
-                    "<p class=\"line\" style=\"text-align:center\"><img src=\"data:image/png;base64," +
-                    b64 + "\" style=\"max-width:100%;height:auto\"/></p>\n";
+                return b64.Length == 0 ? "" : ImgTag(b64, "png");
+            }
+            if (ln.StartsWith(GifMarker, StringComparison.Ordinal))
+            {
+                var b64 = ln.Substring(GifMarker.Length).Trim();
+                return b64.Length == 0 ? "" : ImgTag(b64, "gif");
             }
             if (ln.StartsWith(HtmlMarker, StringComparison.Ordinal))
                 return ln.Substring(HtmlMarker.Length) + "\n";
@@ -269,7 +301,13 @@ namespace Calcpad.Core.Python
         //                                             (.eq, var, .mat, <table>...) SIN escapar
         // Así los valores/tablas se ven como worksheet Calcpad (no texto plano).
         private const string ImgMarker = "__CPSPY_IMG__:";
+        private const string GifMarker = "__CPSPY_GIF__:";   // animación → GIF embebido
         private const string HtmlMarker = "__CPSPY_HTML__:";
+
+        /// <summary>&lt;img&gt; centrado con data-uri base64 del tipo dado (png/gif).</summary>
+        private static string ImgTag(string b64, string kind) =>
+            "<p class=\"line\" style=\"text-align:center\"><img src=\"data:image/" + kind +
+            ";base64," + b64 + "\" style=\"max-width:100%;height:auto\"/></p>\n";
 
         /// <summary>Renderiza el stdout de python: texto plano como bloque pre-wrap,
         /// __CPSPY_IMG__ como &lt;img&gt;, y __CPSPY_HTML__ como HTML crudo (markup Calcpad).</summary>
@@ -294,10 +332,13 @@ namespace Calcpad.Core.Python
                 {
                     FlushText();
                     var b64 = ln.Substring(ImgMarker.Length).Trim();
-                    if (b64.Length > 0)
-                        sb.Append("<p class=\"line\" style=\"text-align:center\"><img src=\"data:image/png;base64,")
-                          .Append(b64)
-                          .Append("\" style=\"max-width:100%;height:auto\"/></p>\n");
+                    if (b64.Length > 0) sb.Append(ImgTag(b64, "png"));
+                }
+                else if (ln.StartsWith(GifMarker, StringComparison.Ordinal))
+                {
+                    FlushText();
+                    var b64 = ln.Substring(GifMarker.Length).Trim();
+                    if (b64.Length > 0) sb.Append(ImgTag(b64, "gif"));
                 }
                 else if (ln.StartsWith(HtmlMarker, StringComparison.Ordinal))
                 {
@@ -436,15 +477,58 @@ namespace Calcpad.Core.Python
         // Captura de figuras matplotlib: backend Agg + plt.show() -> PNG base64 (__CPSPY_IMG__).
         // Asi el .py es Python PURO (plt.show()) y la figura aparece embebida en Calcpad-Py;
         // ejecutado con python real, plt.show() abre la ventana normal.
+        //
+        // ANIMACIONES: FuncAnimation/ArtistAnimation se interceptan (se registran al crearse)
+        // y al flush se guardan como GIF (PillowWriter) embebido via __CPSPY_GIF__. La figura
+        // de cada animación NO se vuelca también como PNG estático (se evita el duplicado).
+        // Si Pillow no está, cae a guardar el primer frame como PNG.
         private const string _mplPreamble = @"
 try:
     import matplotlib as _mpl
     _mpl.use(""Agg"")
     import matplotlib.pyplot as _pltcap
-    import io as _iocap, base64 as _b64cap
+    import matplotlib.animation as _animcap
+    import io as _iocap, base64 as _b64cap, os as _oscap, tempfile as _tmpcap
+    _cpspy_anims = []
+    def _cpspy_track_anim(_an):
+        _cpspy_anims.append(_an); return _an
+    _Orig_FuncAnim = _animcap.FuncAnimation
+    class _CpspyFuncAnimation(_Orig_FuncAnim):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); _cpspy_track_anim(self)
+    _animcap.FuncAnimation = _CpspyFuncAnimation
+    _pltcap.matplotlib.animation.FuncAnimation = _CpspyFuncAnimation
+    _Orig_ArtistAnim = _animcap.ArtistAnimation
+    class _CpspyArtistAnimation(_Orig_ArtistAnim):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); _cpspy_track_anim(self)
+    _animcap.ArtistAnimation = _CpspyArtistAnimation
+    def _cpspy_anim_fps(_an):
+        _iv = getattr(_an, '_interval', None)
+        try: return max(1, round(1000.0 / float(_iv))) if _iv else 20
+        except Exception: return 20
     def _cpspy_flush_figs():
+        _anim_figs = set()
+        for _an in _cpspy_anims:
+            _fig = getattr(_an, '_fig', None)
+            _gp = None
+            try:
+                # PillowWriter exige una RUTA de archivo (no acepta BytesIO) → temp .gif
+                _fd, _gp = _tmpcap.mkstemp(suffix="".gif"", prefix=""cpspy_anim_""); _oscap.close(_fd)
+                _an.save(_gp, writer=_animcap.PillowWriter(fps=_cpspy_anim_fps(_an)))
+                with open(_gp, ""rb"") as _gf:
+                    _realprint(""__CPSPY_GIF__:"" + _b64cap.b64encode(_gf.read()).decode())
+                if _fig is not None: _anim_figs.add(id(_fig))
+            except Exception:
+                pass  # sin Pillow → la figura cae como PNG estático abajo
+            finally:
+                try:
+                    if _gp and _oscap.path.exists(_gp): _oscap.remove(_gp)
+                except Exception: pass
+        _cpspy_anims.clear()
         for _n in _pltcap.get_fignums():
             _f = _pltcap.figure(_n)
+            if id(_f) in _anim_figs: continue
             _bf = _iocap.BytesIO(); _f.savefig(_bf, format=""png"", dpi=110, bbox_inches=""tight""); _bf.seek(0)
             _realprint(""__CPSPY_IMG__:"" + _b64cap.b64encode(_bf.read()).decode())
         _pltcap.close(""all"")

@@ -19,8 +19,35 @@ namespace Calcpad.Core.Python
 
         public static int TimeoutMs { get; set; } = 60000;
 
+        /// <summary>Carpeta del documento actual (.py). Se usa como WorkingDirectory del
+        /// subproceso y se agrega a PYTHONPATH para que los `import &lt;modulo_hermano&gt;`
+        /// (ej. `import fem_numpy`) y los `open("archivo_relativo")` encuentren los
+        /// archivos que están JUNTO al script. Sin esto, el script corre en %TEMP%
+        /// y falla con ModuleNotFoundError. La pone el WPF/CLI antes de ejecutar.</summary>
+        public static string ScriptDirectory { get; set; }
+
         private static string DefaultInterpreter()
             => OperatingSystem.IsWindows() ? "python" : "python3";
+
+        /// <summary>Carpeta de trabajo efectiva: ScriptDirectory si es válida, si no el CWD actual.</summary>
+        private static string WorkDir()
+        {
+            if (!string.IsNullOrEmpty(ScriptDirectory) && Directory.Exists(ScriptDirectory))
+                return ScriptDirectory;
+            return Directory.GetCurrentDirectory();
+        }
+
+        /// <summary>Aplica WorkingDirectory + PYTHONPATH (carpeta del documento) al subproceso,
+        /// para que los imports de módulos hermanos y los open() relativos funcionen.</summary>
+        private static void ApplyScriptLocation(ProcessStartInfo psi)
+        {
+            var workDir = WorkDir();
+            try { psi.WorkingDirectory = workDir; } catch { }
+            var existing = Environment.GetEnvironmentVariable("PYTHONPATH");
+            psi.Environment["PYTHONPATH"] = string.IsNullOrEmpty(existing)
+                ? workDir
+                : workDir + Path.PathSeparator + existing;
+        }
 
         public static (string Stdout, string Stderr, bool Ok) Execute(string code)
         {
@@ -40,6 +67,7 @@ namespace Calcpad.Core.Python
                     StandardErrorEncoding = Encoding.UTF8,
                 };
                 psi.Environment["PYTHONIOENCODING"] = "utf-8";
+                ApplyScriptLocation(psi);
 
                 using var proc = Process.Start(psi);
                 if (proc == null)
@@ -90,6 +118,7 @@ namespace Calcpad.Core.Python
                 };
                 psi.Environment["PYTHONIOENCODING"] = "utf-8";
                 psi.Environment["PYTHONUNBUFFERED"] = "1";
+                ApplyScriptLocation(psi);
 
                 using var proc = Process.Start(psi);
                 if (proc == null)
@@ -122,6 +151,43 @@ namespace Calcpad.Core.Python
             finally
             {
                 try { if (File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+            }
+        }
+
+        /// <summary>Ejecuta un script GUI (PyQt/PySide/PyVista/tkinter) de forma DESACOPLADA:
+        /// arranca el proceso, NO redirige stdout ni espera a que termine, y devuelve
+        /// enseguida. Así la ventana nativa (Qt/VTK) se abre y vive por su cuenta — el
+        /// cuaderno no la embebe ni se bloquea por el timeout. El .py temporal queda en
+        /// %TEMP% (lo limpia el SO) porque el proceso hijo lo necesita mientras corre.</summary>
+        public static (string Info, bool Ok) ExecuteDetached(string code)
+        {
+            string tempFile = Path.Combine(Path.GetTempPath(), "calcpad_pygui_" + Guid.NewGuid().ToString("N") + ".py");
+            try
+            {
+                File.WriteAllText(tempFile, code, new UTF8Encoding(false));
+                var psi = new ProcessStartInfo
+                {
+                    FileName = Interpreter,
+                    Arguments = $"-X utf8 \"{tempFile}\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,        // sin consola; la ventana GUI sí aparece
+                    RedirectStandardOutput = false,
+                    RedirectStandardError = false,
+                };
+                psi.Environment["PYTHONIOENCODING"] = "utf-8";
+                ApplyScriptLocation(psi);
+                var proc = Process.Start(psi);   // NO using/await: vive independiente
+                if (proc == null)
+                    return ("No se pudo iniciar el intérprete de Python.", false);
+                return ("🪟 Interfaz gráfica (Qt/PyVista) abierta en una ventana aparte.", true);
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return ($"No se encontró el intérprete '{Interpreter}'.", false);
+            }
+            catch (Exception ex)
+            {
+                return ($"Error lanzando la interfaz Python: {ex.Message}", false);
             }
         }
 

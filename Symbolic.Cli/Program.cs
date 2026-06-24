@@ -372,6 +372,8 @@ namespace Calcpad.Cli
                     // el CSS template de Calcpad (clases matrix/tr/td/var/eq/b).
                     var pipeline = new Calcpad.Core.Python.PythonPipeline();
                     pipeline.ForceRealPython = isLegacy; // --legacy ⇒ forzar python real
+                    // Carpeta del .py → imports hermanos (import fem_numpy) y open() relativos.
+                    Calcpad.Core.Python.RealPython.ScriptDirectory = path;
                     if (isStreamDebug)
                     {
                         pipeline.StreamingMode = true;

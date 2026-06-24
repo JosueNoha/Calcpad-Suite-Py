@@ -1460,6 +1460,13 @@ namespace Calcpad.Wpf
                 GC.Collect(2, GCCollectionMode.Forced, blocking: true);
                 GC.WaitForPendingFinalizers();
                 DiagLog("Pre-parse GC done");
+                // Carpeta del documento → la ve el fallback a python real para que
+                // `import <modulo_hermano>` (ej. fem_numpy) y open("archivo_relativo")
+                // encuentren los archivos que están JUNTO al .py (no en %TEMP%).
+                Calcpad.Core.Python.RealPython.ScriptDirectory =
+                    !string.IsNullOrEmpty(CurrentFileName) && File.Exists(CurrentFileName)
+                        ? Path.GetDirectoryName(CurrentFileName)
+                        : DocumentPath;
                 await Task.Run(() =>
                 {
                     var pipeline = new Calcpad.Core.Python.PythonPipeline();
