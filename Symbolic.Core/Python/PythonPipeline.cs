@@ -538,26 +538,39 @@ except Exception:
 ";
 
         private const string _pyHelpers = @"
+import html as _cpspy_html
 def _cpspy_n(x):
     if isinstance(x, float): return ('%.6g' % x)
-    return str(x)
+    s = str(x)
+    if len(s) > 120: s = s[:120] + '…'           # truncar celdas/escalares largos
+    return _cpspy_html.escape(s)
 def _cpspy_fmt(v):
     try:
         import numpy as _np
-        if isinstance(v, _np.ndarray): v = v.tolist()
+        if isinstance(v, _np.ndarray):
+            if v.size > 200: return _cpspy_html.escape('ndarray shape=' + str(v.shape) + ' dtype=' + str(v.dtype))
+            v = v.tolist()
     except Exception:
         pass
+    if isinstance(v, dict):                        # dicts (ej. resultados FEM): solo las claves, compacto
+        ks = list(v.keys())
+        return _cpspy_html.escape('{' + ', '.join(str(k) for k in ks[:20]) + ('' if len(ks)<=20 else ', …') + '}')
     if isinstance(v, (list, tuple)):
-        if len(v) > 0 and isinstance(v[0], (list, tuple)):
-            rows = ''.join('<span class=""row"">' + ''.join('<span class=""cell"">' + _cpspy_n(c) + '</span>' for c in r) + '</span>' for r in v)
+        flat = (len(v) > 0 and isinstance(v[0], (list, tuple)))
+        n = min(len(v), 200)                       # limitar filas para no volcar matrices enormes
+        rows = ''
+        if flat:
+            for r in v[:n]:
+                rows += '<span class=""row"">' + ''.join('<span class=""cell"">' + _cpspy_n(c) + '</span>' for c in r[:50]) + '</span>'
         else:
-            rows = '<span class=""row"">' + ''.join('<span class=""cell"">' + _cpspy_n(x) + '</span>' for x in v) + '</span>'
+            rows = '<span class=""row"">' + ''.join('<span class=""cell"">' + _cpspy_n(x) + '</span>' for x in v[:200]) + '</span>'
         return '<span class=""mat""><span class=""lb""></span><span class=""cells"">' + rows + '</span><span class=""rb""></span></span>'
     return _cpspy_n(v)
 def _cpspy_emit(name, val):
     import types as _t
     if callable(val) or isinstance(val, _t.ModuleType): return
-    _realprint('__CPSPY_HTML__:<p class=""line""><span class=""eq""><var>' + name + '</var> = ' + _cpspy_fmt(val) + '</span></p>')
+    _h = '<p class=""line""><span class=""eq""><var>' + name + '</var> = ' + _cpspy_fmt(val) + '</span></p>'
+    _realprint('__CPSPY_HTML__:' + _h.replace(chr(10),' ').replace(chr(13),' '))   # marcador es POR-LINEA → 1 sola linea
 ";
     }
 }
