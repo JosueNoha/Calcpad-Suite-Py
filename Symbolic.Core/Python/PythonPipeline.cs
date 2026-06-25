@@ -571,7 +571,7 @@ try:
                     smin = lo if smin is None else min(smin, lo); smax = hi if smax is None else max(smax, hi)
             if smin is None: smin, smax = 0.0, 1.0
             rng = (smax - smin) or 1.0
-            calls = []; lo3 = [1e30,1e30,1e30]; hi3 = [-1e30,-1e30,-1e30]; ntri = 0
+            calls = []; dps = []; lo3 = [1e30,1e30,1e30]; hi3 = [-1e30,-1e30,-1e30]; ntri = 0
             for m in meshes:
                 try: tm = m.triangulate()
                 except Exception: tm = m
@@ -580,6 +580,11 @@ try:
                 for d in range(3): lo3[d] = min(lo3[d], float(pts[:,d].min())); hi3[d] = max(hi3[d], float(pts[:,d].max()))
                 sc = getattr(tm, 'active_scalars', None)
                 sc = _nppv.asarray(sc).ravel() if (sc is not None and len(sc)) else None
+                if len(dps) < 6000:                          # hover: registrar nudos+valor (datatip)
+                    _st = max(1, len(pts)//6000)
+                    for _ii in range(0, len(pts), _st):
+                        _v = float(sc[_ii]) if sc is not None else 0.0
+                        dps.append('GL3.datapoint(%.4f,%.4f,%.4f,%.6g);' % (pts[_ii,0],pts[_ii,1],pts[_ii,2],_v))
                 for (a0,b0,c0) in _cpspy_pv_tris(tm):
                     p0,p1,p2 = pts[a0],pts[b0],pts[c0]
                     if sc is not None: t0=(float(sc[a0])-smin)/rng; t1=(float(sc[b0])-smin)/rng; t2=(float(sc[c0])-smin)/rng
@@ -594,7 +599,8 @@ try:
             _gljs = open(_ospv.path.join(_tmppv.gettempdir(),'cpspy_glplot.min.js'), encoding='utf-8').read()
             js = ('GL3.figure3(""pv"",860,620);GL3.etabs=true;GL3.view3(40,20);'
                 + 'GL3.axis3(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f);' % (lo3[0],hi3[0],lo3[1],hi3[1],lo3[2],hi3[2])
-                + ''.join(calls) + 'GL3.render3();GL3.colorbar3(%.4f,%.4f,340);' % (smin,smax))
+                + ''.join(calls) + 'GL3.datatip(""valor"");' + ''.join(dps)
+                + 'GL3.render3();GL3.colorbar3(%.4f,%.4f,340);' % (smin,smax))
             html = '<div><script>if(!window.GL3){' + _gljs + '}</script><script>(function(){' + js + '})();</script></div>'
             _realprint('__CPSPY_HTML__:' + html.replace(chr(10),' ').replace(chr(13),' '))
         except Exception as _e:
