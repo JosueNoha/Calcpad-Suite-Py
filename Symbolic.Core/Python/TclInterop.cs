@@ -45,6 +45,10 @@ namespace Calcpad.Core.Python
                 var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
                 string[] siteRoots = {
+                    // 1º: junto a la app (si en el futuro se bundlea el "OpenSees pack")
+                    Path.Combine(AppContext.BaseDirectory, "opensees"),
+                    AppContext.BaseDirectory,
+                    // 2º: instalación de Python/xara del sistema (pip install opensees)
                     Path.Combine(roaming, "Python"),
                     Path.Combine(home, "AppData", "Local", "Programs", "Python"),
                     @"C:\Program Files\Python312", @"C:\Program Files\Python311",

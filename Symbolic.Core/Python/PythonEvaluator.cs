@@ -360,8 +360,26 @@ namespace Calcpad.Core.Python
                 return null;
             }
             FlushOpsPattern();
-            return ParseOpsResult(_opensees.Eval(a.Length > 0 ? name + " " + a : name));
+            var res = _opensees.Eval(a.Length > 0 ? name + " " + a : name);
+            // Solo las CONSULTAS devuelven valor (para asignar/print). Los comandos de
+            // construcción (node/element/fix/...) son void → None → NO se auto-renderizan
+            // (evita líneas basura tipo "ops.fix(...) = 0 1 2" en la hoja).
+            return _opsQueries.Contains(name) ? ParseOpsResult(res) : null;
         }
+        private static readonly System.Collections.Generic.HashSet<string> _opsQueries =
+            new(StringComparer.Ordinal)
+        {
+            "nodeDisp","nodeReaction","nodeCoord","nodeVel","nodeAccel","nodeEigenvector","nodeBounds",
+            "nodeMass","nodeDOFs","nodeResponse","nodeRotation","nodeUnbalance","setNodeDisp",
+            "eleForce","eleResponse","eleNodes","eleDynamicalForce","eleType",
+            "sectionForce","sectionDeformation","sectionStiffness","sectionFlexibility","sectionLocation","sectionWeight",
+            "basicForce","basicDeformation","basicStiffness",
+            "getNodeTags","getEleTags","getNDM","getNDF","getTime","getLoadFactor","getEleClassTags",
+            "getEleLoadTags","getEleLoadClassTags","getFixedNodes","getFixedDOFs","getConstrainedNodes",
+            "getConstrainedDOFs","getRetainedNodes","getRetainedDOFs","getParamTags","getParamValue","getNumElements",
+            "eigen","modalProperties","responseSpectrum",
+            "systemSize","numFact","numIter","testIter","testNorm","testIters","version","getPID","getNP","recorder","analyze",
+        };
         private void FlushOpsPattern()
         {
             if (_opsPatHeader == null) return;
