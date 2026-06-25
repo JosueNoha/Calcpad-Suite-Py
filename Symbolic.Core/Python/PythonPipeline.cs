@@ -541,23 +541,64 @@ except Exception:
     def _cpspy_flush_figs(): pass
 ";
 
-        // Captura de PyVista: patchea Plotter.show() → render OFF-SCREEN → PNG embebido
-        // (__CPSPY_IMG__), igual que matplotlib. Así un script PyVista se EMBEBE en el
-        // worksheet en vez de abrir ventana. (pyvistaqt/PyQt full-app sí abre ventana.)
+        // Captura de PyVista: patchea Plotter.show() → convierte las mallas al motor 3D
+        // nativo GL3 (glplot.js) → 3D INTERACTIVO embebido (rotar + hover + bandas ETABS),
+        // misma visualización que PyVista pero dentro del worksheet (sin ventana externa).
+        // Si la malla es enorme (>40k triángulos) cae a screenshot PNG estático.
         private const string _pvPreamble = @"
 try:
     import pyvista as _pvcap
     _pvcap.OFF_SCREEN = True
-    import io as _iopv, base64 as _b64pv
-    from PIL import Image as _Impv
+    import numpy as _nppv, os as _ospv, tempfile as _tmppv, io as _iopv, base64 as _b64pv
+    def _cpspy_pv_tris(tm):
+        fa = getattr(tm, 'faces', None); out = []
+        if fa is not None and len(fa):
+            fa = _nppv.asarray(fa); i = 0
+            while i < len(fa):
+                n = int(fa[i])
+                if n == 3: out.append((int(fa[i+1]), int(fa[i+2]), int(fa[i+3])))
+                elif n == 4: out.append((int(fa[i+1]), int(fa[i+2]), int(fa[i+3]))); out.append((int(fa[i+1]), int(fa[i+3]), int(fa[i+4])))
+                i += n + 1
+        return out
     def _cpspy_pv_show(self, *a, **k):
         try:
-            for _kk in ('interactive','auto_close','interactive_update','full_screen'): k.pop(_kk, None)
-            _img = self.screenshot(return_img=True)
-            _bf = _iopv.BytesIO(); _Impv.fromarray(_img).save(_bf, format='PNG'); _bf.seek(0)
-            _realprint('__CPSPY_IMG__:' + _b64pv.b64encode(_bf.read()).decode())
+            meshes = list(getattr(self, 'meshes', []) or [])
+            smin = smax = None
+            for m in meshes:
+                sc = getattr(m, 'active_scalars', None)
+                if sc is not None and len(sc) and _nppv.asarray(sc).ndim == 1:
+                    lo = float(_nppv.nanmin(sc)); hi = float(_nppv.nanmax(sc))
+                    smin = lo if smin is None else min(smin, lo); smax = hi if smax is None else max(smax, hi)
+            if smin is None: smin, smax = 0.0, 1.0
+            rng = (smax - smin) or 1.0
+            calls = []; lo3 = [1e30,1e30,1e30]; hi3 = [-1e30,-1e30,-1e30]; ntri = 0
+            for m in meshes:
+                try: tm = m.triangulate()
+                except Exception: tm = m
+                pts = _nppv.asarray(tm.points, float)
+                if len(pts) == 0: continue
+                for d in range(3): lo3[d] = min(lo3[d], float(pts[:,d].min())); hi3[d] = max(hi3[d], float(pts[:,d].max()))
+                sc = getattr(tm, 'active_scalars', None)
+                sc = _nppv.asarray(sc).ravel() if (sc is not None and len(sc)) else None
+                for (a0,b0,c0) in _cpspy_pv_tris(tm):
+                    p0,p1,p2 = pts[a0],pts[b0],pts[c0]
+                    if sc is not None: t0=(float(sc[a0])-smin)/rng; t1=(float(sc[b0])-smin)/rng; t2=(float(sc[c0])-smin)/rng
+                    else: t0=t1=t2=0.5
+                    arr = '[' + ','.join('%.4f'%v for v in (p0[0],p0[1],p0[2],p1[0],p1[1],p1[2],p2[0],p2[1],p2[2],p2[0],p2[1],p2[2])) + ']'
+                    calls.append('GL3.fill3(%s,%.4f,%.4f,%.4f,%.4f);' % (arr,t0,t1,t2,t2)); ntri += 1
+            if ntri == 0 or ntri > 40000:
+                from PIL import Image as _Impv
+                _img = self.screenshot(return_img=True); _bf = _iopv.BytesIO()
+                _Impv.fromarray(_img).save(_bf, format='PNG'); _bf.seek(0)
+                _realprint('__CPSPY_IMG__:' + _b64pv.b64encode(_bf.read()).decode()); return
+            _gljs = open(_ospv.path.join(_tmppv.gettempdir(),'cpspy_glplot.min.js'), encoding='utf-8').read()
+            js = ('GL3.figure3(""pv"",860,620);GL3.etabs=true;GL3.view3(40,20);'
+                + 'GL3.axis3(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f);' % (lo3[0],hi3[0],lo3[1],hi3[1],lo3[2],hi3[2])
+                + ''.join(calls) + 'GL3.render3();GL3.colorbar3(%.4f,%.4f,340);' % (smin,smax))
+            html = '<div><script>if(!window.GL3){' + _gljs + '}</script><script>(function(){' + js + '})();</script></div>'
+            _realprint('__CPSPY_HTML__:' + html.replace(chr(10),' ').replace(chr(13),' '))
         except Exception as _e:
-            _realprint('__CPSPY_HTML__:<p class=""err"">PyVista no se pudo capturar: ' + str(_e) + '</p>')
+            _realprint('__CPSPY_HTML__:<p class=""err"">PyVista 3D: ' + str(_e) + '</p>')
     _pvcap.Plotter.show = _cpspy_pv_show
 except Exception:
     pass

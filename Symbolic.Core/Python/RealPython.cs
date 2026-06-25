@@ -37,10 +37,24 @@ namespace Calcpad.Core.Python
             return Directory.GetCurrentDirectory();
         }
 
+        /// <summary>Escribe el motor 3D nativo (glplot.js/GL3) a un temp fijo, para que la
+        /// intercepción de PyVista lo inyecte inline y muestre el 3D INTERACTIVO embebido.</summary>
+        public static void EnsureGlPlot()
+        {
+            try
+            {
+                var p = Path.Combine(Path.GetTempPath(), "cpspy_glplot.min.js");
+                if (!File.Exists(p) || new FileInfo(p).Length != GlPlotJs.Min.Length)
+                    File.WriteAllText(p, GlPlotJs.Min, new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
         /// <summary>Aplica WorkingDirectory + PYTHONPATH (carpeta del documento) al subproceso,
         /// para que los imports de módulos hermanos y los open() relativos funcionen.</summary>
         private static void ApplyScriptLocation(ProcessStartInfo psi)
         {
+            EnsureGlPlot();
             var workDir = WorkDir();
             try { psi.WorkingDirectory = workDir; } catch { }
             var existing = Environment.GetEnvironmentVariable("PYTHONPATH");
