@@ -43,6 +43,7 @@ namespace Calcpad.Core.Python
         public Action<string> Output { get; set; } = _ => { };
         public Action<string> HtmlOut { get; set; } = _ => { };
         private int _vizId;
+        private TclInterop _opensees;   // intérprete OpenSees nativo (MKL Pardiso+JIT), creado on-demand
 
         private static readonly HashSet<string> NativeModules = new(StringComparer.Ordinal)
         { "math", "cmath" };
@@ -1090,6 +1091,27 @@ namespace Calcpad.Core.Python
                 var res = new PyList();
                 for (int i = 0; i < n; i++) res.Items.Add(x[i]);
                 return res;
+            });
+
+            // OpenSees NATIVO (OpenSeesRT.dll vía Tcl, MKL Pardiso + JIT). Sin openseespy/CPython.
+            //   opensees("node 1 0 0")            → ejecuta un comando OpenSees
+            //   opensees("element ...", "...")    → batch (varios comandos, ensamble en C++)
+            //   uy = float(opensees("nodeDisp 2 2"))
+            Reg("opensees", (a, kw) =>
+            {
+                if (!TclInterop.Available)
+                    throw new PyRuntimeError("RuntimeError",
+                        "OpenSees nativo no disponible (falta OpenSeesRT.dll / Tcl). " + (TclInterop.LastError ?? ""));
+                string cmd;
+                if (a.Length == 1 && a[0] is string s0) cmd = s0;
+                else
+                {
+                    var b = new StringBuilder();
+                    for (int i = 0; i < a.Length; i++) { if (i > 0) b.Append(' '); b.Append(PyOps.Str(a[i])); }
+                    cmd = b.ToString();
+                }
+                _opensees ??= new TclInterop();
+                return _opensees.Eval(cmd);
             });
 
             Reg("print", (a, kw) =>
