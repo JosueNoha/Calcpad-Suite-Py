@@ -941,9 +941,156 @@ namespace Calcpad.Core.Python
         // ===================================================================
         //  BUILTINS
         // ===================================================================
+        // Eliminacion gaussiana con pivoteo parcial (fallback si LAPACK no esta).
+        private static double[] GaussSolve(int n, double[] A, double[] b)
+        {
+            var M = (double[])A.Clone();
+            var x = (double[])b.Clone();
+            for (int k = 0; k < n; k++)
+            {
+                int piv = k; double best = Math.Abs(M[k * n + k]);
+                for (int i = k + 1; i < n; i++)
+                {
+                    double v = Math.Abs(M[i * n + k]);
+                    if (v > best) { best = v; piv = i; }
+                }
+                if (piv != k)
+                {
+                    for (int j = 0; j < n; j++) { var t = M[k * n + j]; M[k * n + j] = M[piv * n + j]; M[piv * n + j] = t; }
+                    var tb = x[k]; x[k] = x[piv]; x[piv] = tb;
+                }
+                double d = M[k * n + k];
+                for (int i = k + 1; i < n; i++)
+                {
+                    double f = M[i * n + k] / d;
+                    if (f == 0.0) continue;
+                    for (int j = k; j < n; j++) M[i * n + j] -= f * M[k * n + j];
+                    x[i] -= f * x[k];
+                }
+            }
+            for (int i = n - 1; i >= 0; i--)
+            {
+                double s = x[i];
+                for (int j = i + 1; j < n; j++) s -= M[i * n + j] * x[j];
+                x[i] = s / M[i * n + i];
+            }
+            return x;
+        }
+
+        // Jacobi ciclico (Numerical Recipes) para matriz SIMETRICA n x n.
+        // d = autovalores ; V row-major con V[i*n+k] = i-esima componente del
+        // autovector k. (Eigen estandar A·v = lambda·v.)
+        private static void JacobiEig(int n, double[] Ain, out double[] d, out double[] V)
+        {
+            var a = (double[])Ain.Clone();
+            V = new double[n * n];
+            for (int i = 0; i < n; i++) V[i * n + i] = 1.0;
+            d = new double[n];
+            var b = new double[n]; var z = new double[n];
+            for (int i = 0; i < n; i++) { d[i] = a[i * n + i]; b[i] = d[i]; }
+            void Rot(double[] m, int i, int j, int k, int l, double s, double tau)
+            { double g = m[i * n + j]; double h = m[k * n + l]; m[i * n + j] = g - s * (h + g * tau); m[k * n + l] = h + s * (g - h * tau); }
+            for (int iter = 0; iter < 100; iter++)
+            {
+                double sm = 0;
+                for (int p = 0; p < n - 1; p++) for (int q = p + 1; q < n; q++) sm += Math.Abs(a[p * n + q]);
+                if (sm == 0.0) break;
+                double thresh = iter < 3 ? 0.2 * sm / (n * n) : 0.0;
+                for (int p = 0; p < n - 1; p++)
+                {
+                    for (int q = p + 1; q < n; q++)
+                    {
+                        double g = 100.0 * Math.Abs(a[p * n + q]);
+                        if (iter > 3 && Math.Abs(d[p]) + g == Math.Abs(d[p]) && Math.Abs(d[q]) + g == Math.Abs(d[q]))
+                            a[p * n + q] = 0.0;
+                        else if (Math.Abs(a[p * n + q]) > thresh)
+                        {
+                            double h = d[q] - d[p]; double t;
+                            if (Math.Abs(h) + g == Math.Abs(h)) t = a[p * n + q] / h;
+                            else { double theta = 0.5 * h / a[p * n + q]; t = 1.0 / (Math.Abs(theta) + Math.Sqrt(1.0 + theta * theta)); if (theta < 0.0) t = -t; }
+                            double c = 1.0 / Math.Sqrt(1.0 + t * t); double s = t * c; double tau = s / (1.0 + c);
+                            h = t * a[p * n + q];
+                            z[p] -= h; z[q] += h; d[p] -= h; d[q] += h; a[p * n + q] = 0.0;
+                            for (int j = 0; j < p; j++) Rot(a, j, p, j, q, s, tau);
+                            for (int j = p + 1; j < q; j++) Rot(a, p, j, j, q, s, tau);
+                            for (int j = q + 1; j < n; j++) Rot(a, p, j, q, j, s, tau);
+                            for (int j = 0; j < n; j++) Rot(V, j, p, j, q, s, tau);
+                        }
+                    }
+                }
+                for (int p = 0; p < n; p++) { b[p] += z[p]; d[p] = b[p]; z[p] = 0.0; }
+            }
+        }
+
         private void RegisterBuiltins()
         {
             void Reg(string name, Func<object[], PyDict, object> fn) => Globals.Vars[name] = new PyBuiltin(name, fn);
+
+            // eig_sym(A): autovalores/autovectores de A simetrica n×n (lista de listas).
+            // Devuelve [vals, vecs] con vals ASCENDENTE y vecs[k] = autovector de vals[k]
+            // (lista de n). Motor NATIVO (Jacobi), sin numpy. Para modal: A = D^-1/2 K D^-1/2.
+            Reg("eig_sym", (a, kw) =>
+            {
+                if (a.Length < 1 || a[0] is not PyList A || A.Count == 0 || A.Items[0] is not PyList)
+                    throw new PyRuntimeError("TypeError", "eig_sym(A): A debe ser matriz simetrica (lista de listas)");
+                int n = A.Count;
+                var Ar = new double[n * n];
+                for (int i = 0; i < n; i++)
+                {
+                    if (A.Items[i] is not PyList rowL || rowL.Count != n)
+                        throw new PyRuntimeError("ValueError", "eig_sym: A no es cuadrada");
+                    for (int j = 0; j < n; j++) Ar[i * n + j] = PyOps.ToDouble(rowL.Items[j]);
+                }
+                JacobiEig(n, Ar, out var d, out var V);
+                var order = new int[n];
+                for (int i = 0; i < n; i++) order[i] = i;
+                Array.Sort(order, (x, y) => d[x].CompareTo(d[y]));
+                var vals = new PyList();
+                for (int k = 0; k < n; k++) vals.Items.Add(d[order[k]]);
+                var vecs = new PyList();
+                for (int k = 0; k < n; k++)
+                {
+                    var vk = new PyList();
+                    int col = order[k];
+                    for (int i = 0; i < n; i++) vk.Items.Add(V[i * n + col]);
+                    vecs.Items.Add(vk);
+                }
+                var res = new PyList(); res.Items.Add(vals); res.Items.Add(vecs);
+                return res;
+            });
+
+            // solve(A, b): resuelve el sistema lineal A·x = b en el motor NATIVO.
+            // A = matriz n×n (lista de listas), b = vector n. Usa el solver LAPACK
+            // nativo (libopenblas / DGESV); si no esta disponible, eliminacion
+            // gaussiana managed. Permite FEM denso sin numpy ni python real.
+            Reg("solve", (a, kw) =>
+            {
+                if (a.Length < 2)
+                    throw new PyRuntimeError("TypeError", "solve(A, b)");
+                if (a[0] is not PyList A || A.Count == 0 || A.Items[0] is not PyList)
+                    throw new PyRuntimeError("TypeError", "solve: A debe ser una matriz (lista de listas)");
+                int n = A.Count;
+                var Arow = new double[n * n];
+                for (int i = 0; i < n; i++)
+                {
+                    if (A.Items[i] is not PyList rowL || rowL.Count != n)
+                        throw new PyRuntimeError("ValueError", "solve: A no es cuadrada");
+                    var row = rowL.Items;
+                    for (int j = 0; j < n; j++) Arow[i * n + j] = PyOps.ToDouble(row[j]);
+                }
+                if (a[1] is not PyList bl || bl.Count != n)
+                    throw new PyRuntimeError("ValueError", "solve: dim(b) != n");
+                var bv = new double[n];
+                for (int i = 0; i < n; i++) bv[i] = PyOps.ToDouble(bl.Items[i]);
+
+                double[] x = Calcpad.Core.LapackInterop.Available
+                    ? Calcpad.Core.LapackInterop.Solve(n, Arow, bv)
+                    : GaussSolve(n, Arow, bv);
+
+                var res = new PyList();
+                for (int i = 0; i < n; i++) res.Items.Add(x[i]);
+                return res;
+            });
 
             Reg("print", (a, kw) =>
             {

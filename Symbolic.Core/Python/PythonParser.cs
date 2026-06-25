@@ -319,6 +319,16 @@ namespace Calcpad.Core.Python
             {
                 _p++; // newline
                 SkipNewlines();
+                // Líneas SÓLO-comentario al inicio del bloque: el tokenizer las emite
+                // ANTES del INDENT (no afectan la indentación). Las preservamos como
+                // CommentStmt y seguimos buscando el bloque indentado.
+                while (Cur.Type == PyTok.Comment)
+                {
+                    var ctxt = Cur.Text;
+                    body.Add(new CommentStmt { Text = ctxt, IsHeading = IsHeadingComment(ctxt), Line = Cur.Line });
+                    _p++;
+                    SkipNewlines();
+                }
                 if (Cur.Type != PyTok.Indent)
                     throw new PythonParseException("Se esperaba un bloque indentado", Cur.Line);
                 _p++; // indent
