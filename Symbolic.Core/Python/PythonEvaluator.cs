@@ -46,7 +46,7 @@ namespace Calcpad.Core.Python
         private TclInterop _opensees;   // intérprete OpenSees nativo (MKL Pardiso+JIT), creado on-demand
 
         private static readonly HashSet<string> NativeModules = new(StringComparer.Ordinal)
-        { "math", "cmath" };
+        { "math", "cmath", "openseespy", "opensees", "openseespywin" };
 
         public PythonEvaluator()
         {
@@ -325,7 +325,82 @@ namespace Calcpad.Core.Python
         private PyModule LoadNativeModule(string name)
         {
             if (name == "math" || name == "cmath") return PythonMath.Module;
+            // openseespy / opensees → módulo OpenSees DINÁMICO (ops.node, ops.element, ...)
+            // resuelto nativamente contra OpenSeesRT.dll (MKL Pardiso+JIT) vía TclInterop.
+            if (name == "openseespy" || name == "opensees" || name == "openseespywin")
+                return _opsModule ??= new PyModule("__opensees__");
             throw new PythonNotSupported($"módulo {name}");
+        }
+        private PyModule _opsModule;
+
+        private string _opsPatHeader;       // patrón de cargas abierto (replica el buffer de openseespy)
+        private StringBuilder _opsPatBody;
+
+        // ops.<comando>(*args) → "comando arg1 arg2 ..." → OpenSeesRT; parsea el resultado.
+        internal object OpsCommand(string name, object[] args)
+        {
+            if (!TclInterop.Available)
+                throw new PyRuntimeError("RuntimeError",
+                    "OpenSees nativo no disponible (falta OpenSeesRT.dll / Tcl). " + (TclInterop.LastError ?? ""));
+            _opensees ??= new TclInterop();
+            string a = FormatOpsArgs(args);
+            // OpenSeesRT exige el patrón con llaves: pattern Plain t ts { load ...; sp ... }.
+            // openseespy lo bufferea en Python; lo replicamos: pattern ABRE, load/sp/eleLoad
+            // se ACUMULAN, y cualquier otro comando CIERRA el patrón.
+            if (name == "pattern")
+            {
+                FlushOpsPattern();
+                _opsPatHeader = "pattern " + a;
+                _opsPatBody = new StringBuilder();
+                return null;
+            }
+            if (_opsPatHeader != null && (name == "load" || name == "sp" || name == "eleLoad"))
+            {
+                _opsPatBody.Append(name).Append(' ').Append(a).Append("; ");
+                return null;
+            }
+            FlushOpsPattern();
+            return ParseOpsResult(_opensees.Eval(a.Length > 0 ? name + " " + a : name));
+        }
+        private void FlushOpsPattern()
+        {
+            if (_opsPatHeader == null) return;
+            var cmd = _opsPatHeader + " { " + _opsPatBody + " }";
+            _opsPatHeader = null; _opsPatBody = null;
+            _opensees.Eval(cmd);
+        }
+        private string FormatOpsArgs(object[] args)
+        {
+            var sb = new StringBuilder();
+            for (int i = 0; i < args.Length; i++) { if (i > 0) sb.Append(' '); AppendOpsArg(sb, args[i]); }
+            return sb.ToString();
+        }
+        private void AppendOpsArg(StringBuilder sb, object a)
+        {
+            switch (a)
+            {
+                case PyList l:
+                    for (int i = 0; i < l.Items.Count; i++) { if (i > 0) sb.Append(' '); AppendOpsArg(sb, l.Items[i]); }
+                    break;
+                case double d: sb.Append(d.ToString("R", System.Globalization.CultureInfo.InvariantCulture)); break;
+                case long lo: sb.Append(lo); break;
+                case int ii: sb.Append(ii); break;
+                case bool b: sb.Append(b ? 1 : 0); break;
+                default: sb.Append(PyOps.Str(a)); break;
+            }
+        }
+        private static object ParseOpsResult(string r)
+        {
+            if (string.IsNullOrWhiteSpace(r)) return null;
+            var parts = r.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            var nums = new System.Collections.Generic.List<object>();
+            foreach (var p in parts)
+                if (double.TryParse(p, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dv))
+                    nums.Add(dv);
+                else return r;                      // no todo numérico → string crudo
+            if (nums.Count == 0) return r;
+            if (nums.Count == 1) return nums[0];    // un número → double
+            var pl = new PyList(); pl.Items.AddRange(nums); return pl;   // varios → lista
         }
 
         private void ExecClassDef(ClassDef cd, PyScope scope)
@@ -904,6 +979,8 @@ namespace Calcpad.Core.Python
             {
                 case PyModule m:
                     if (m.Attrs.TryGetValue(name, out var mv)) return mv;
+                    if (m.Name == "__opensees__")   // módulo OpenSees DINÁMICO: ops.<comando>(*args)
+                        return new PyBuiltin(name, (a, kw) => OpsCommand(name, a));
                     throw new PyRuntimeError("AttributeError", $"module '{m.Name}' has no attribute '{name}'");
                 case PyInstance inst:
                 {
