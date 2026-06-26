@@ -286,7 +286,10 @@ namespace Calcpad.Core.Python
                     for (int i = 0; i < t.Elements.Count; i++) { if (i > 0) sb.Append(", "); sb.Append(ExprToHtml(t.Elements[i])); }
                     return sb.Append(')').ToString();
                 }
-                default: return WebUtility.HtmlEncode(n.GetType().Name);
+                // Nodo no soportado para eco (ternario, comprehensions, lambda, ...):
+                // devolver "" → se omite la fórmula y se muestra solo "var = valor"
+                // (antes volcaba el nombre del tipo, ej. "IfExp").
+                default: return "";
             }
         }
 
