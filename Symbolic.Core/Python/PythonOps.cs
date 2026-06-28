@@ -117,13 +117,14 @@ namespace Calcpad.Core.Python
                 case "^": return BitOp(op, a, b);
                 case "<<": return ToLong(a) << (int)ToLong(b);
                 case ">>": return ToLong(a) >> (int)ToLong(b);
-                case "@": throw new PythonNotSupported("operador @ (matmul)");
+                case "@": return PyNumpy.MatMul(a, b);
             }
             throw new PyRuntimeError("TypeError", $"operador binario desconocido '{op}'");
         }
 
         private static object Add(object a, object b)
         {
+            if (a is PyNdArray || b is PyNdArray) return PyNumpy.Binary("+", a, b);
             if (IsNumber(a) && IsNumber(b)) return NumResult(a, b, (x, y) => x + y, (x, y) => x + y);
             if (a is string s1 && b is string s2) return s1 + s2;
             if (a is PyList l1 && b is PyList l2) { var r = new PyList(l1.Items); r.Items.AddRange(l2.Items); return r; }
@@ -132,12 +133,14 @@ namespace Calcpad.Core.Python
         }
         private static object Sub(object a, object b)
         {
+            if (a is PyNdArray || b is PyNdArray) return PyNumpy.Binary("-", a, b);
             if (IsNumber(a) && IsNumber(b)) return NumResult(a, b, (x, y) => x - y, (x, y) => x - y);
             if (a is PySet s1 && b is PySet s2) { var r = new PySet(); foreach (var x in s1.Items) if (!s2.Contains(x)) r.Add(x); return r; }
             throw new PyRuntimeError("TypeError", $"no se puede restar {TypeName(a)} y {TypeName(b)}");
         }
         private static object Mul(object a, object b)
         {
+            if (a is PyNdArray || b is PyNdArray) return PyNumpy.Binary("*", a, b);
             if (IsNumber(a) && IsNumber(b)) return NumResult(a, b, (x, y) => x * y, (x, y) => x * y);
             if (a is string s && IsInt(b)) return Repeat(s, ToLong(b));
             if (IsInt(a) && b is string s2) return Repeat(s2, ToLong(a));
@@ -156,6 +159,7 @@ namespace Calcpad.Core.Python
         }
         private static object TrueDiv(object a, object b)
         {
+            if (a is PyNdArray || b is PyNdArray) return PyNumpy.Binary("/", a, b);
             double y = ToDouble(b);
             if (y == 0) throw new PyRuntimeError("ZeroDivisionError", "division by zero");
             return ToDouble(a) / y;
@@ -229,6 +233,7 @@ namespace Calcpad.Core.Python
 
         public static object Negate(object a)
         {
+            if (a is PyNdArray nd) return PyNumpy.Negate(nd);
             if (IsInt(a)) return -ToLong(a);
             if (a is double d) return -d;
             throw new PyRuntimeError("TypeError", $"operador unario - no soportado para {TypeName(a)}");
@@ -252,6 +257,7 @@ namespace Calcpad.Core.Python
             PyModule => "module",
             PyClass c => "type",
             PyInstance pi => pi.Class?.Name ?? "object",
+            PyNdArray => "numpy.ndarray",
             _ => o.GetType().Name
         };
 
@@ -275,6 +281,7 @@ namespace Calcpad.Core.Python
                 case PyModule m: return $"<module '{m.Name}'>";
                 case PyClass c: return $"<class '{c.Name}'>";
                 case PyInstance pi: return $"<{pi.Class?.Name} object>";
+                case PyNdArray nd: return nd.ToString();
                 default: return o.ToString();
             }
         }

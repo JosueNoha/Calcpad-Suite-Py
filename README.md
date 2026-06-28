@@ -11,11 +11,29 @@ system `python` for `numpy` / `scipy` / `matplotlib` / `plotly`.
 > Same renderized HTML/PDF/DOCX output as Calcpad, same auto-run-on-save,
 > same template — only the input syntax is Python.
 
-📥 **Download:** [CalcpadSuitePy-Setup-1.0.2.exe](https://github.com/GiorgioBurbanelli89/Calcpad-Suite-Py/releases) (self-contained, no .NET required)
+📥 **Download:** [CalcpadSuitePy-Setup-1.0.8.exe](https://github.com/GiorgioBurbanelli89/Calcpad-Suite-Py/releases) (self-contained, no .NET required)
 📁 Ejemplos `.py` bundleados con el installer (se copian a `Documents\Calcpad Suite Py\Examples\`).
 
 > ℹ️ El motor MATLAB (`.m`) vive en el proyecto hermano **Calcpad Lab** — ver
 > [`README-CalcpadLab.md`](./README-CalcpadLab.md). Este repo es la variante **Python-only**.
+
+---
+
+## Novedades — Selector de entornos de Python (2026-06-27)
+
+**Menú `Python` — elegí en qué *entorno* (environment) corren tus scripts**, igual que el
+"Select Interpreter" de VS Code. Resuelve el clásico `ModuleNotFoundError: No module named 'numpy'`
+al abrir un script en otra PC: ya no dependés del Python global, apuntás Suite Py al entorno que
+tiene las librerías. Ver la sección [**Entornos de Python**](#entornos-de-python-environments--dónde-viven-las-librerías).
+
+- **Lista de entornos detectados** automáticamente: Python del sistema (PATH / *py launcher*),
+  `venv` (`.venv` / `venv` / `env`) que estén junto al script, venvs agregados a mano, y entornos **conda**.
+- **Crear entorno nuevo** desde el menú (`python -m venv`) e **instalar numpy · scipy · matplotlib**
+  adentro (pip, con salida en vivo) — sin tocar el Python global.
+- **Agregar** un venv existente por carpeta, **verificar** qué librerías tiene, y **abrir** su carpeta.
+- La elección **se guarda** (`%LOCALAPPDATA%\CalcpadSuitePy\pyenv.json`) y se reaplica al arrancar.
+
+Código: `Symbolic.Core/Python/PythonEnvironments.cs` (motor) + menú `Python` en `MainWindow.xaml`/`.cs`.
 
 ---
 
@@ -90,14 +108,16 @@ que Calcpad pero con Python.
 
 ## Instalación
 
-1. Descargar **CalcpadSuitePy-Setup-1.0.2.exe** desde los
+1. Descargar **CalcpadSuitePy-Setup-1.0.8.exe** desde los
    [releases del repo](https://github.com/GiorgioBurbanelli89/Calcpad-Suite-Py/releases).
 2. Doble-click → aceptar UAC → seguir el wizard (acepta asociación `.py` para abrir scripts con doble-click).
 3. Al primer arranque, los ejemplos se copian a `Documents\Calcpad Suite Py\Examples\`.
 4. Abrir cualquier `.py` (`Ctrl+O`) o crear uno nuevo (`Ctrl+N`); con **AutoRun** se ejecuta al guardar.
 
 **No requiere .NET Desktop Runtime** — el runtime .NET 10 viaja dentro del installer (self-contained).
-Para el fallback a librerías, necesitas un **Python del sistema** con numpy/matplotlib/scipy instalados.
+Para los scripts que **importan librerías** (numpy/scipy/matplotlib) necesitás un **Python** con esas
+librerías instaladas; lo elegís desde el menú **`Python`** (ver abajo). Los scripts de Python "puro"
+(escalares, `for`/`while`/`if`, fórmulas) **no necesitan instalar nada** — corren en el motor C# nativo.
 
 CLI usage:
 
@@ -105,6 +125,100 @@ CLI usage:
 CalcpadSuitePyCli.exe my_script.py html -s   # generate HTML output
 CalcpadSuitePyCli.exe my_script.py pdf        # generate PDF
 ```
+
+## Entornos de Python (environments) — dónde viven las librerías
+
+> **Resumen en una línea:** un *entorno* es una **carpeta** con su propio Python y sus propias
+> librerías. En Python **no se instalan las librerías "globalmente"**, se instalan **dentro de un
+> entorno** para evitar que dos proyectos se pisen las versiones. Suite Py te deja **elegir** qué
+> entorno usar.
+
+### ¿Por qué? (la analogía de la caja de herramientas)
+
+Pensá un entorno como una **caja de herramientas** por proyecto:
+
+- 🧰 **Caja A** (entorno del proyecto estructural) → tiene `numpy`, `scipy`, `matplotlib`.
+- 🧰 **Caja B** (otro proyecto) → tiene otras librerías, quizá otra versión de numpy.
+
+Cada caja tiene **solo** lo que ese proyecto necesita. Así, actualizar una librería en un proyecto
+**no rompe** otro. Por eso la práctica estándar es **no instalar nada global** y armar un entorno por
+proyecto. La doc oficial: <https://docs.python.org/es/3/library/venv.html>.
+
+Un entorno es literalmente una carpeta:
+
+```
+mi_proyecto\
+├── mesa_torsion.py
+└── .venv\                      ← EL ENTORNO (una carpeta)
+    ├── pyvenv.cfg
+    ├── Scripts\python.exe       ← su Python privado
+    └── Lib\site-packages\
+        ├── numpy\               ← la librería vive ACÁ, no en el sistema
+        ├── scipy\
+        └── matplotlib\
+```
+
+### ¿Qué es "elegir el entorno"?
+
+Es **decirle a Suite Py de qué carpeta sacar las librerías** al correr un `.py`:
+
+- Elegís un entorno **con** numpy → el script funciona.
+- Elegís uno **sin** numpy (típico: el Python "pelado" del sistema) → `ModuleNotFoundError: No module named 'numpy'`.
+
+### Crearlo a mano (terminal) — equivalente a lo que hace el menú
+
+```bat
+cd C:\ruta\a\mi_proyecto
+python -m venv .venv                       :: crea la carpeta-entorno
+.venv\Scripts\activate                     :: "entra" al entorno
+pip install numpy scipy matplotlib         :: instala las libs DENTRO del entorno
+```
+
+> El mismo `.venv` sirve para **IDLE** (`.venv\Scripts\python.exe -m idlelib`) y para **Suite Py**;
+> no hay que instalar las librerías dos veces.
+
+### Hacerlo desde Suite Py (sin terminal) — menú `Python`
+
+| Acción del menú | Qué hace |
+|---|---|
+| **(lista de entornos)** | Tilda el entorno activo; clic en otro para cambiar. Detecta sistema, `.venv` junto al script y conda. |
+| **Agregar entorno existente…** | Apuntá a la carpeta de un `.venv` que ya tengas. |
+| **Crear entorno nuevo…** | Corre `python -m venv` y, si querés, instala numpy·scipy·matplotlib enseguida. |
+| **Instalar / actualizar numpy·scipy·matplotlib** | `pip install` dentro del entorno activo (salida en vivo). |
+| **Verificar librerías** | Muestra ✓/✗ de cada librería en el entorno activo. |
+| **Abrir carpeta** | Abre la carpeta del entorno en el Explorador. |
+
+### Indicarlo DENTRO del script — directiva `#venv` / `#env`
+
+Además del menú (elección global, estilo VS Code), el propio `.py` puede **declarar su entorno** con
+una directiva en comentario (válida en Python: para IDLE es solo un `#`). Tiene **prioridad** sobre el
+menú, **solo para ese script**:
+
+```python
+#venv .venv                         # carpeta venv relativa al script  → .venv\Scripts\python.exe
+# o:
+#env C:\Users\yo\envs\fem           # carpeta venv absoluta
+#env C:\Python312\python.exe        # un intérprete concreto, tal cual
+import numpy as np                  # sale del entorno declarado arriba
+```
+
+Reglas:
+- La ruta es **relativa a la carpeta del `.py`** (o absoluta). Puede apuntar a la **carpeta** del venv
+  o directo a un `python.exe`.
+- Se lee la **primera** directiva `#venv`/`#env` del archivo.
+- Si la ruta no resuelve, Suite Py cae a la elección del menú (no rompe).
+- Es un comentario normal de Python → el mismo `.py` corre igual en IDLE / VS Code / consola.
+
+> 💡 Útil para que un script "viaje" con su entorno: lo abrís en otra PC y ya sabe qué `.venv` usar,
+> sin tocar el menú. Y como Suite Py **auto-detecta** el `.venv` junto al script, muchas veces ni hace
+> falta la directiva.
+
+> ⚠️ **Límite de `venv`:** un entorno se "clona" de un Python base, así que la máquina necesita tener
+> **algún Python instalado** una vez (de [python.org](https://www.python.org/downloads/)). `venv` aísla
+> *las librerías*, no el intérprete base. Para PCs sin ningún Python, la alternativa es empaquetar un
+> Python en el instalador (en evaluación).
+
+---
 
 ## Build from source
 

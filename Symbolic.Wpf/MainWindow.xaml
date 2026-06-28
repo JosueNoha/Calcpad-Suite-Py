@@ -1732,7 +1732,22 @@
                 <MenuItem Click="PdfButton_Click" 
                           Header="{x:Static wpf:MainWindowResources.SaveAsPDF}"/>
             </MenuItem>
-            <MenuItem Command="ApplicationCommands.Help" 
+            <MenuItem x:Name="MenuPython" Header="Python" SubmenuOpened="MenuPython_SubmenuOpened">
+                <MenuItem x:Name="MenuPythonEnvs" Header="(detectando entornos…)" IsEnabled="False"/>
+                <Separator/>
+                <MenuItem x:Name="MenuPythonAddVenv" Header="Agregar entorno existente (carpeta venv)…"
+                          Click="MenuPythonAddVenv_Click"/>
+                <MenuItem x:Name="MenuPythonCreateVenv" Header="Crear entorno nuevo…"
+                          Click="MenuPythonCreateVenv_Click"/>
+                <Separator/>
+                <MenuItem x:Name="MenuPythonInstall" Header="Instalar / actualizar numpy · scipy · matplotlib (entorno activo)"
+                          Click="MenuPythonInstall_Click"/>
+                <MenuItem x:Name="MenuPythonCheck" Header="Verificar librerías del entorno activo"
+                          Click="MenuPythonCheck_Click"/>
+                <MenuItem x:Name="MenuPythonOpenFolder" Header="Abrir carpeta del entorno activo"
+                          Click="MenuPythonOpenFolder_Click"/>
+            </MenuItem>
+            <MenuItem Command="ApplicationCommands.Help"
                       Header="{x:Static wpf:MainWindowResources.Help}"/>
         </Menu>
         <Button Grid.Row="0" x:Name="NewButton" HorizontalAlignment="Left" Height="24" VerticalAlignment="Top" Width="24"

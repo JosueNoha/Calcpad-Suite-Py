@@ -14,8 +14,18 @@ namespace Calcpad.Core.Python
 {
     public static class RealPython
     {
-        /// <summary>Comando del intérprete (python / python3 / py). Configurable.</summary>
+        /// <summary>Comando del intérprete (python / python3 / py). Configurable.
+        /// Lo fija el selector de entornos (PythonEnvironments) o queda en el python del PATH.</summary>
         public static string Interpreter { get; set; } = DefaultInterpreter();
+
+        /// <summary>Override POR-SCRIPT: si el .py declara su entorno con `#venv`/`#env`,
+        /// el pipeline pone aquí el python.exe de ese entorno SOLO para esa ejecución.
+        /// Tiene prioridad sobre Interpreter. null/"" → se usa Interpreter (la elección del menú).</summary>
+        public static string OverrideInterpreter { get; set; }
+
+        /// <summary>Intérprete efectivo: el override por-script si existe, si no el del selector.</summary>
+        public static string Effective =>
+            string.IsNullOrEmpty(OverrideInterpreter) ? Interpreter : OverrideInterpreter;
 
         public static int TimeoutMs { get; set; } = 60000;
 
@@ -71,7 +81,7 @@ namespace Calcpad.Core.Python
                 File.WriteAllText(tempFile, code, new UTF8Encoding(false));
                 var psi = new ProcessStartInfo
                 {
-                    FileName = Interpreter,
+                    FileName = Effective,
                     Arguments = $"-X utf8 \"{tempFile}\"",
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -121,7 +131,7 @@ namespace Calcpad.Core.Python
                 File.WriteAllText(tempFile, code, new UTF8Encoding(false));
                 var psi = new ProcessStartInfo
                 {
-                    FileName = Interpreter,
+                    FileName = Effective,
                     Arguments = $"-X utf8 -u \"{tempFile}\"",   // -u = stdout sin buffer → llega línea a línea
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -181,7 +191,7 @@ namespace Calcpad.Core.Python
                 File.WriteAllText(tempFile, code, new UTF8Encoding(false));
                 var psi = new ProcessStartInfo
                 {
-                    FileName = Interpreter,
+                    FileName = Effective,
                     Arguments = $"-X utf8 \"{tempFile}\"",
                     UseShellExecute = false,
                     CreateNoWindow = true,        // sin consola; la ventana GUI sí aparece
@@ -212,7 +222,7 @@ namespace Calcpad.Core.Python
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = Interpreter,
+                    FileName = Effective,
                     Arguments = "--version",
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,

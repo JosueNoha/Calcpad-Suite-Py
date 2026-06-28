@@ -40,6 +40,12 @@ namespace Calcpad.Core.Python
         {
             LastRanWithRealPython = false;
 
+            // Directiva por-script `#venv`/`#env`: si el .py declara su entorno,
+            // ese python.exe tiene prioridad sobre la elección del menú, SOLO para
+            // esta ejecución. Si no hay directiva, queda null → se usa el del menú.
+            try { RealPython.OverrideInterpreter = PythonEnvironments.ResolveScriptEnv(source); }
+            catch { RealPython.OverrideInterpreter = null; }
+
             List<PyNode> stmts;
             try
             {
@@ -493,6 +499,157 @@ try:
     import matplotlib.pyplot as _pltcap
     import matplotlib.animation as _animcap
     import io as _iocap, base64 as _b64cap, os as _oscap, tempfile as _tmpcap
+    import numpy as _npm
+    # --- 3D INTERACTIVO: interceptar plot_surface(X,Y,Z) y mandarlo al canvas GL3
+    #     (girar/mover/hover), en vez de PNG estatico. Igual idea que PyVista. ---
+    try:
+        from mpl_toolkits.mplot3d import Axes3D as _Ax3
+        _cpspy_surfs = {}
+        _orig_psurf = _Ax3.plot_surface
+        def _cpspy_psurf(self, X, Y, Z, *a, **k):
+            try: _cpspy_surfs.setdefault(id(self.figure), []).append((self, _npm.asarray(X, float), _npm.asarray(Y, float), _npm.asarray(Z, float)))
+            except Exception: pass
+            return _orig_psurf(self, X, Y, Z, *a, **k)
+        _Ax3.plot_surface = _cpspy_psurf
+        _cpspy_lines3 = {}
+        _orig_plot3 = _Ax3.plot
+        def _cpspy_plot3(self, *a, **k):   # captura líneas 3D (ej. columnas) → GL3.line3
+            try:
+                if len(a) >= 3 and hasattr(a[2], '__len__') and not isinstance(a[2], str):
+                    _cpspy_lines3.setdefault(id(self.figure), []).append((_npm.asarray(a[0], float), _npm.asarray(a[1], float), _npm.asarray(a[2], float)))
+            except Exception: pass
+            return _orig_plot3(self, *a, **k)
+        _Ax3.plot = _cpspy_plot3
+    except Exception:
+        _cpspy_surfs = {}
+        _cpspy_lines3 = {}
+    # Render unificado a GL3: superficie 3D (_flat=False) o campo plano 2D estilo
+    # contorno visto desde arriba (_flat=True). Ambos con hover (datapoint) del valor.
+    def _cpspy_gl3(_fid, X, Y, Z, _flat, _title, _lines=None, _wval=None):
+        _q = chr(34)
+        nr, nc = Z.shape
+        _st = max(1, int(round(max(nr, nc) / 40.0)))   # ~40×40 celdas (ágil + suave)
+        X = X[::_st, ::_st]; Y = Y[::_st, ::_st]; Z = Z[::_st, ::_st]
+        C = Z if _wval is None else _wval[::_st, ::_st]   # escalar de COLOR/VALOR (deflexión si se pasa)
+        nr, nc = Z.shape
+        _zmin = float(_npm.nanmin(Z)); _zmax = float(_npm.nanmax(Z))           # geometría (eje Z)
+        _cmin = float(_npm.nanmin(C)); _cmax = float(_npm.nanmax(C)); _rng = (_cmax - _cmin) or 1.0
+        def _tv(v): return (float(v) - _cmin) / _rng
+        def _zc(v): return 0.0 if _flat else float(v)
+        _calls = []
+        for i in range(nr - 1):
+            for j in range(nc - 1):
+                _arr = '[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]' % (X[i,j],Y[i,j],_zc(Z[i,j]),X[i+1,j],Y[i+1,j],_zc(Z[i+1,j]),X[i+1,j+1],Y[i+1,j+1],_zc(Z[i+1,j+1]),X[i,j+1],Y[i,j+1],_zc(Z[i,j+1]))
+                _calls.append('GL3.fill3(%s,%.4f,%.4f,%.4f,%.4f);' % (_arr, _tv(C[i,j]), _tv(C[i+1,j]), _tv(C[i+1,j+1]), _tv(C[i,j+1])))
+        _lcalls = []; _lzmin = _zmin
+        if _lines and not _flat:           # columnas u otras líneas 3D → GL3.line3
+            for (_lx, _ly, _lz) in _lines:
+                for _m in range(len(_lx) - 1):
+                    _lcalls.append('GL3.line3(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%s);' % (float(_lx[_m]),float(_ly[_m]),float(_lz[_m]),float(_lx[_m+1]),float(_ly[_m+1]),float(_lz[_m+1]), _q + '#333333' + _q))
+                try: _lzmin = min(_lzmin, float(_npm.min(_lz)))
+                except Exception: pass
+        _dps = []; _stp = max(1, (nr*nc)//4500); _kk = 0   # denso → hover continuo en toda la superficie
+        for i in range(nr):
+            for j in range(nc):
+                if _kk % _stp == 0: _dps.append('GL3.datapoint(%.4f,%.4f,%.4f,%.6g);' % (X[i,j],Y[i,j],_zc(Z[i,j]),C[i,j]))
+                _kk += 1
+        if _flat: _zlo = -0.5; _zhi = 0.5; _vw = 'GL3.view3(0,89);'
+        else: _zlo = min(_zmin, _lzmin); _zhi = _zmax; _vw = 'GL3.view3(40,22);'
+        _gljs = open(_oscap.path.join(_tmpcap.gettempdir(), 'cpspy_glplot.min.js'), encoding='utf-8').read()
+        _js = ('GL3.figure3(' + _q + _fid + _q + ',780,520);GL3.etabs=false;' + _vw   # etabs=false → jet_r
+               + 'GL3.axis3(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f);' % (float(X.min()),float(X.max()),float(Y.min()),float(Y.max()),_zlo,_zhi)
+               + ''.join(_calls) + ''.join(_lcalls) + 'GL3.datatip(' + _q + 'valor' + _q + ');' + ''.join(_dps)
+               + 'GL3.render3();GL3.colorbar3(%.4f,%.4f,320);' % (_cmin, _cmax))
+        _cap = ('<div style=font-weight:bold;color:#1a4f7a;margin-top:6px>' + _title + '</div>') if _title else ''
+        _html = '<div style=text-align:center>' + _cap + '<script>if(!window.GL3){' + _gljs + '}</script><script>(function(){' + _js + '})();</script></div>'
+        _realprint('__CPSPY_HTML__:' + _html.replace(chr(10), ' ').replace(chr(13), ' '))
+    def _cpspy_emit_gl3(_fig, _surfs):
+        _ax, X, Y, Z = _surfs[0]
+        _w = None
+        try:                       # campo escalar de color/valor (deflexión w) si el script lo guardó
+            _s3 = getattr(_ax, '_cpspy_surf3d', None)
+            if _s3 is not None and len(_s3) >= 4: _w = _npm.asarray(_s3[3], float)
+        except Exception: _w = None
+        _cpspy_gl3('mpl', X, Y, Z, False, '', _cpspy_lines3.get(id(_fig), []), _w)
+    # --- 2D INTERACTIVO: interceptar contourf(X,Y,Z) → campo plano GL3 con hover ---
+    _cpspy_contours = {}
+    try:
+        import matplotlib.axes as _maxes
+        _orig_cf = _maxes.Axes.contourf
+        def _cpspy_cf(self, *a, **k):
+            try:
+                if len(a) >= 3 and hasattr(a[2], 'shape'):
+                    _Xc, _Yc, _Zc = a[0], a[1], a[2]
+                elif len(a) >= 1:
+                    _Zc = _npm.asarray(a[0], float); _ny, _nx = _Zc.shape
+                    _Yc, _Xc = _npm.meshgrid(range(_ny), range(_nx), indexing='ij')
+                else:
+                    return _orig_cf(self, *a, **k)
+                _cpspy_contours.setdefault(id(self.figure), []).append((self, _npm.asarray(_Xc, float), _npm.asarray(_Yc, float), _npm.asarray(_Zc, float)))
+            except Exception: pass
+            return _orig_cf(self, *a, **k)
+        _maxes.Axes.contourf = _cpspy_cf
+    except Exception:
+        pass
+    # Canvas 2D de MAPA DE CALOR (heatmap jet_r + colorbar + hover por píxel).
+    _CPMAPJS = '''window.CPMAP={plot:function(id,d){var cv=document.getElementById(id);if(!cv)return;var ctx=cv.getContext('2d');var W=cv.width,H=cv.height,mL=44,mR=66,mT=22,mB=30;var pw=W-mL-mR,ph=H-mT-mB;var nr=d.nr,nc=d.nc,z=d.z,zmin=d.zmin,zmax=d.zmax,rng=(zmax-zmin)||1;var x0=d.x0,x1=d.x1,y0=d.y0,y1=d.y1;function jetr(t){t=Math.max(0,Math.min(1,t));var u=1-t;function c(q){return Math.max(0,Math.min(1,1.5-Math.abs(4*u-q)));}return 'rgb('+Math.round(c(3)*255)+','+Math.round(c(2)*255)+','+Math.round(c(1)*255)+')';}function draw(hv){ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);ctx.fillStyle='#1a4f7a';ctx.font='bold 12px sans-serif';ctx.textAlign='center';ctx.fillText(d.title,mL+pw/2,14);var cw=pw/nc,chh=ph/nr,r,c2,t;for(r=0;r<nr;r++){for(c2=0;c2<nc;c2++){t=(z[r*nc+c2]-zmin)/rng;ctx.fillStyle=jetr(t);ctx.fillRect(mL+c2*cw,mT+ph-(r+1)*chh,cw+0.7,chh+0.7);}}ctx.strokeStyle='#444';ctx.strokeRect(mL,mT,pw,ph);ctx.fillStyle='#555';ctx.font='9px sans-serif';ctx.textAlign='center';var i,vx,vy;for(i=0;i<=5;i++){vx=x0+(x1-x0)*i/5;ctx.fillText(vx.toFixed(1),mL+pw*i/5,mT+ph+12);}ctx.textAlign='right';for(i=0;i<=5;i++){vy=y0+(y1-y0)*i/5;ctx.fillText(vy.toFixed(1),mL-4,mT+ph-ph*i/5+3);}var cbx=mL+pw+12,cbw=13;for(i=0;i<ph;i++){ctx.fillStyle=jetr(i/ph);ctx.fillRect(cbx,mT+ph-i,cbw,1.6);}ctx.strokeStyle='#444';ctx.strokeRect(cbx,mT,cbw,ph);ctx.fillStyle='#333';ctx.textAlign='left';ctx.font='8px sans-serif';for(i=0;i<=4;i++){ctx.fillText((zmin+rng*i/4).toFixed(2),cbx+cbw+2,mT+ph-ph*i/4+3);}if(hv){ctx.strokeStyle='#000';ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(hv.px,hv.py,4,0,6.2832);ctx.stroke();var s='x='+hv.x.toFixed(2)+' y='+hv.y.toFixed(2)+'  '+hv.v.toFixed(4);ctx.font='10px sans-serif';var tw=ctx.measureText(s).width;var tx=hv.px+8,ty=hv.py-8;if(tx+tw+8>mL+pw)tx=tx-tw-18;if(ty<mT+10)ty=hv.py+18;ctx.fillStyle='rgba(255,255,224,0.97)';ctx.fillRect(tx-4,ty-11,tw+8,15);ctx.strokeStyle='#888';ctx.strokeRect(tx-4,ty-11,tw+8,15);ctx.fillStyle='#111';ctx.textAlign='left';ctx.fillText(s,tx,ty);}}draw(null);cv.onmousemove=function(e){var rb=cv.getBoundingClientRect();var mx=e.clientX-rb.left,my=e.clientY-rb.top;if(mx<mL||mx>mL+pw||my<mT||my>mT+ph){draw(null);return;}var dx=x0+(mx-mL)/pw*(x1-x0),dy=y1-(my-mT)/ph*(y1-y0);var c2=Math.min(nc-1,Math.max(0,Math.round((dx-x0)/((x1-x0)||1)*(nc-1))));var r=Math.min(nr-1,Math.max(0,Math.round((dy-y0)/((y1-y0)||1)*(nr-1))));draw({px:mx,py:my,x:dx,y:dy,v:z[r*nc+c2]});};cv.onmouseleave=function(){draw(null);};}};'''
+    def _cpspy_emit_contours(_fig, _flds):
+        _Q = chr(39)
+        _parts = ['<script>if(!window.CPMAP){' + _CPMAPJS + '}</script>']
+        for _ix in range(len(_flds)):
+            _ax, X, Y, Z = _flds[_ix]
+            try: _ax0x = abs(float(X[-1, 0] - X[0, 0])) >= abs(float(Y[-1, 0] - Y[0, 0]))
+            except Exception: _ax0x = True
+            if _ax0x: _xs = X[:, 0]; _ys = Y[0, :]; _Zm = Z.T
+            else: _xs = X[0, :]; _ys = Y[:, 0]; _Zm = Z
+            _nr, _nc = _Zm.shape
+            _st = max(1, int(round(max(_nr, _nc) / 60.0)))
+            _Zm = _Zm[::_st, ::_st]; _nr, _nc = _Zm.shape
+            _x0 = float(_xs.min()); _x1 = float(_xs.max()); _y0 = float(_ys.min()); _y1 = float(_ys.max())
+            _zmin = float(_npm.nanmin(_Zm)); _zmax = float(_npm.nanmax(_Zm))
+            _zflat = ','.join('%.5g' % v for v in _Zm.ravel())
+            _ttl = (_ax.get_title() or '').replace(_Q, ' ')
+            _cid = 'cpmap_' + str(_ix)
+            _d = ('{title:' + _Q + _ttl + _Q + ',nr:%d,nc:%d,x0:%.4f,x1:%.4f,y0:%.4f,y1:%.4f,zmin:%.6g,zmax:%.6g,z:[%s]}'
+                  % (_nr, _nc, _x0, _x1, _y0, _y1, _zmin, _zmax, _zflat))
+            _parts.append('<canvas id=' + _cid + ' width=420 height=320 style=margin:4px;vertical-align:top></canvas>')
+            _parts.append('<script>CPMAP.plot(' + _Q + _cid + _Q + ',' + _d + ');</script>')
+        _realprint('__CPSPY_HTML__:<div style=text-align:center>' + ''.join(_parts).replace(chr(10), ' ') + '</div>')
+    # --- CANVAS 2D de LINEAS (diagramas) con hover propio (sin librerías) ---
+    _CP2DJS = '''window.CP2D={plot:function(id,d){var cv=document.getElementById(id);if(!cv)return;var ctx=cv.getContext('2d');var W=cv.width,H=cv.height,mL=50,mR=12,mT=26,mB=34;var pw=W-mL-mR,ph=H-mT-mB;var x0=d.xmin,x1=d.xmax,y0=d.ymin,y1=d.ymax;if(x1==x0)x1=x0+1;if(y1==y0)y1=y0+1;function sx(x){return mL+(x-x0)/(x1-x0)*pw;}function sy(y){return mT+ph-(y-y0)/(y1-y0)*ph;}function draw(hv){ctx.clearRect(0,0,W,H);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);ctx.fillStyle='#1a4f7a';ctx.font='bold 12px sans-serif';ctx.textAlign='center';ctx.fillText(d.title,W/2,15);ctx.strokeStyle='#ececec';ctx.fillStyle='#555';ctx.font='9px sans-serif';var i,g,v;ctx.textAlign='center';for(i=0;i<=5;i++){v=x0+(x1-x0)*i/5;g=sx(v);ctx.beginPath();ctx.moveTo(g,mT);ctx.lineTo(g,mT+ph);ctx.stroke();ctx.fillText(v.toFixed(1),g,mT+ph+12);}ctx.textAlign='right';for(i=0;i<=5;i++){v=y0+(y1-y0)*i/5;g=sy(v);ctx.beginPath();ctx.moveTo(mL,g);ctx.lineTo(mL+pw,g);ctx.stroke();ctx.fillText(v.toFixed(1),mL-5,g+3);}ctx.fillStyle='#555';ctx.textAlign='center';ctx.font='10px sans-serif';ctx.fillText(d.xlabel,mL+pw/2,H-4);if(y0<0&&y1>0){ctx.strokeStyle='#999';ctx.beginPath();var z=sy(0);ctx.moveTo(mL,z);ctx.lineTo(mL+pw,z);ctx.stroke();}var s,k,se;for(s=0;s<d.series.length;s++){se=d.series[s];ctx.strokeStyle=se.c;ctx.fillStyle=se.c;ctx.lineWidth=1.8;ctx.beginPath();for(k=0;k<se.x.length;k++){if(k==0)ctx.moveTo(sx(se.x[k]),sy(se.y[k]));else ctx.lineTo(sx(se.x[k]),sy(se.y[k]));}ctx.stroke();for(k=0;k<se.x.length;k++){ctx.beginPath();ctx.arc(sx(se.x[k]),sy(se.y[k]),2.3,0,6.2832);ctx.fill();}}ctx.font='9px sans-serif';ctx.textAlign='left';var ly=mT+5;for(s=0;s<d.series.length;s++){if(d.series[s].l){ctx.fillStyle=d.series[s].c;ctx.fillRect(mL+5,ly+s*12,9,3);ctx.fillStyle='#333';ctx.fillText(d.series[s].l,mL+18,ly+4+s*12);}}if(hv){ctx.strokeStyle='#222';ctx.beginPath();ctx.arc(sx(hv.x),sy(hv.y),4,0,6.2832);ctx.stroke();var tx=sx(hv.x)+8,ty=sy(hv.y)-8,t=hv.l+' x='+hv.x.toFixed(2)+'  y='+hv.y.toFixed(3);ctx.font='10px sans-serif';var tw=ctx.measureText(t).width;if(tx+tw+8>W)tx=tx-tw-18;ctx.fillStyle='rgba(255,255,224,0.96)';ctx.fillRect(tx-4,ty-11,tw+8,15);ctx.strokeStyle='#999';ctx.strokeRect(tx-4,ty-11,tw+8,15);ctx.fillStyle='#222';ctx.textAlign='left';ctx.fillText(t,tx,ty);}}draw(null);cv.onmousemove=function(e){var r=cv.getBoundingClientRect();var mx=e.clientX-r.left,my=e.clientY-r.top;if(mx<mL||mx>mL+pw||my<mT||my>mT+ph){draw(null);return;}var xd=x0+(mx-mL)/pw*(x1-x0);var b=null,bd=1e18,s,k,se,yi;for(s=0;s<d.series.length;s++){se=d.series[s];if(se.x.length<2||xd<se.x[0]||xd>se.x[se.x.length-1])continue;yi=se.y[se.y.length-1];for(k=0;k<se.x.length-1;k++){if(xd>=se.x[k]&&xd<=se.x[k+1]){var t=(xd-se.x[k])/((se.x[k+1]-se.x[k])||1);yi=se.y[k]+t*(se.y[k+1]-se.y[k]);break;}}var dy=sy(yi)-my,dd=dy*dy;if(dd<bd){bd=dd;b={x:xd,y:yi,l:se.l||''};}}if(b)draw(b);else draw(null);};cv.onmouseleave=function(){draw(null);};}};'''
+    def _cpspy_emit_lines(_fig):
+        import matplotlib.colors as _mcol
+        _Q = chr(39)
+        _axes = [ax for ax in _fig.get_axes() if len(ax.get_lines()) > 0]
+        if not _axes: return False
+        _parts = ['<script>if(!window.CP2D){' + _CP2DJS + '}</script>']
+        _any = False
+        for _ai in range(len(_axes)):
+            ax = _axes[_ai]; _ser = []
+            _xmn = 1e30; _xmx = -1e30; _ymn = 1e30; _ymx = -1e30
+            for ln in ax.get_lines():
+                xd = _npm.asarray(ln.get_xdata(), float); yd = _npm.asarray(ln.get_ydata(), float)
+                if xd.size < 2: continue
+                if xd.size == 2 and yd[0] == yd[1]: continue   # axhline (línea de cero)
+                try: _c = _mcol.to_hex(ln.get_color())
+                except Exception: _c = '#1f77b4'
+                _lbl = ln.get_label(); _lbl = '' if _lbl.startswith('_') else _lbl.replace(_Q, ' ')
+                _ser.append('{x:[' + ','.join('%.4f' % v for v in xd) + '],y:[' + ','.join('%.4f' % v for v in yd) + '],c:' + _Q + _c + _Q + ',l:' + _Q + _lbl + _Q + '}')
+                _xmn = min(_xmn, float(xd.min())); _xmx = max(_xmx, float(xd.max()))
+                _ymn = min(_ymn, float(yd.min())); _ymx = max(_ymx, float(yd.max()))
+            if not _ser: continue
+            _pad = (_ymx - _ymn) * 0.08 or 1.0
+            _ttl = (ax.get_title() or '').replace(_Q, ' '); _xl = (ax.get_xlabel() or '').replace(_Q, ' ')
+            _cid = 'cp2d_' + str(_ai)
+            _d = ('{title:' + _Q + _ttl + _Q + ',xlabel:' + _Q + _xl + _Q
+                  + ',xmin:%.4f,xmax:%.4f,ymin:%.4f,ymax:%.4f,series:[' % (_xmn, _xmx, _ymn - _pad, _ymx + _pad)
+                  + ','.join(_ser) + ']}')
+            _parts.append('<canvas id=' + _cid + ' width=380 height=300 style=margin:4px;vertical-align:top></canvas>')
+            _parts.append('<script>CP2D.plot(' + _Q + _cid + _Q + ',' + _d + ');</script>')
+            _any = True
+        if not _any: return False
+        _realprint('__CPSPY_HTML__:<div style=text-align:center>' + ''.join(_parts).replace(chr(10), ' ') + '</div>')
+        return True
     _cpspy_anims = []
     def _cpspy_track_anim(_an):
         _cpspy_anims.append(_an); return _an
@@ -533,9 +690,22 @@ try:
         for _n in _pltcap.get_fignums():
             _f = _pltcap.figure(_n)
             if id(_f) in _anim_figs: continue
+            if id(_f) in _cpspy_surfs:    # figura con superficie 3D → canvas GL3 interactivo
+                try: _cpspy_emit_gl3(_f, _cpspy_surfs[id(_f)])
+                except Exception as _e3: _realprint('__CPSPY_HTML__:<p class=err>GL3 3D: ' + str(_e3) + '</p>')
+                continue
+            if id(_f) in _cpspy_contours:  # figura con contornos → canvas 2D GL3 con hover
+                try: _cpspy_emit_contours(_f, _cpspy_contours[id(_f)])
+                except Exception as _e4: _realprint('__CPSPY_HTML__:<p class=err>GL3 2D: ' + str(_e4) + '</p>')
+                continue
+            try:                            # figura de líneas → canvas 2D propio con hover
+                if _cpspy_emit_lines(_f): continue
+            except Exception: pass
             _bf = _iocap.BytesIO(); _f.savefig(_bf, format=""png"", dpi=110, bbox_inches=""tight""); _bf.seek(0)
             _realprint(""__CPSPY_IMG__:"" + _b64cap.b64encode(_bf.read()).decode())
         _pltcap.close(""all"")
+        try: _cpspy_surfs.clear(); _cpspy_contours.clear(); _cpspy_lines3.clear()   # evita reuso de id(fig)
+        except Exception: pass
     _pltcap.show = lambda *a, **k: _cpspy_flush_figs()
 except Exception:
     def _cpspy_flush_figs(): pass

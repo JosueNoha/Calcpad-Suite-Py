@@ -46,7 +46,7 @@ namespace Calcpad.Core.Python
         private TclInterop _opensees;   // intérprete OpenSees nativo (MKL Pardiso+JIT), creado on-demand
 
         private static readonly HashSet<string> NativeModules = new(StringComparer.Ordinal)
-        { "math", "cmath", "openseespy", "opensees", "openseespywin" };
+        { "math", "cmath", "openseespy", "opensees", "openseespywin", "numpy" };
 
         public PythonEvaluator()
         {
@@ -329,9 +329,13 @@ namespace Calcpad.Core.Python
             // resuelto nativamente contra OpenSeesRT.dll (MKL Pardiso+JIT) vía TclInterop.
             if (name == "openseespy" || name == "opensees" || name == "openseespywin")
                 return _opsModule ??= new PyModule("__opensees__");
+            // numpy EMBEBIDO (PyNdArray + BlasInterop/LapackInterop) — sin Python externo.
+            if (name == "numpy")
+                return _numpyModule ??= PyNumpy.CreateModule();
             throw new PythonNotSupported($"módulo {name}");
         }
         private PyModule _opsModule;
+        private PyModule _numpyModule;
 
         private string _opsPatHeader;       // patrón de cargas abierto (replica el buffer de openseespy)
         private StringBuilder _opsPatBody;
@@ -458,6 +462,7 @@ namespace Calcpad.Core.Python
                 case IndexExpr ix:
                 {
                     var obj = Eval(ix.Target, scope);
+                    if (obj is PyNdArray nd) { nd.Set(NdSpecs(ix.Index, scope), value); break; }   // A[i,j]=, A[i,:]=
                     var idx = Eval(ix.Index, scope);
                     SetItem(obj, idx, value);
                     break;
@@ -635,9 +640,31 @@ namespace Calcpad.Core.Python
         private object EvalIndex(IndexExpr ix, PyScope scope)
         {
             var obj = Eval(ix.Target, scope);
+            if (obj is PyNdArray nd) return nd.Get(NdSpecs(ix.Index, scope));   // A[i], A[i,j], A[i,:]
             if (ix.Index is SliceExpr sl) return GetSlice(obj, sl, scope);
             var idx = Eval(ix.Index, scope);
             return GetItem(obj, idx);
+        }
+
+        // Convierte el nodo índice (entero, tupla, slice) en specs para PyNdArray.
+        private List<NdSpec> NdSpecs(PyNode node, PyScope scope)
+        {
+            var list = new List<NdSpec>();
+            if (node is TupleLit t) foreach (var e in t.Elements) list.Add(NdOne(e, scope));
+            else list.Add(NdOne(node, scope));
+            return list;
+        }
+        private NdSpec NdOne(PyNode e, PyScope scope)
+        {
+            if (e is SliceExpr sl)
+                return new NdSpec
+                {
+                    Slice = true,
+                    Lo = sl.Lower == null ? null : PyOps.ToLong(Eval(sl.Lower, scope)),
+                    Hi = sl.Upper == null ? null : PyOps.ToLong(Eval(sl.Upper, scope)),
+                    Step = sl.Step == null ? 1 : PyOps.ToLong(Eval(sl.Step, scope))
+                };
+            return new NdSpec { Slice = false, Idx = PyOps.ToLong(Eval(e, scope)) };
         }
 
         private object EvalList(ListLit l, PyScope scope)
@@ -1016,6 +1043,8 @@ namespace Calcpad.Core.Python
                 case PyRuntimeError err:
                     if (name == "args") return new PyTuple(new List<object> { err.Message });
                     return err.Message;
+                case PyNdArray arr:
+                    return PyNumpy.GetAttr(arr, name);   // .T, .shape, .copy(), .sum(), ...
             }
             // Métodos builtin de tipos nativos
             var method = PythonBuiltinMethods.GetMethod(obj, name, this);

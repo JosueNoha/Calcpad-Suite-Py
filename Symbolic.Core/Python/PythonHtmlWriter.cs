@@ -170,6 +170,7 @@ namespace Calcpad.Core.Python
                 case PySet set: return WebUtility.HtmlEncode(PyOps.Str(set));
                 case PyDict d: return DictToHtml(d);
                 case PyRange r: return WebUtility.HtmlEncode(PyOps.Str(r));
+                case PyNdArray arr: return NdToHtml(arr);
                 default: return WebUtility.HtmlEncode(PyOps.Str(value));
             }
         }
@@ -227,6 +228,29 @@ namespace Calcpad.Core.Python
                 sb.Append("</span>");
             }
             sb.Append("</span></span><span class=\"rb\"></span></span>");
+            return sb.ToString();
+        }
+
+        // numpy.ndarray → matriz .eq (con truncado: matrices grandes muestran solo el shape).
+        private static string NdToHtml(PyNdArray a)
+        {
+            const int MAXR = 16, MAXC = 16;
+            if (a.Size > 400 || a.Rows > MAXR || a.Cols > MAXC)
+                return WebUtility.HtmlEncode($"array(shape=({string.Join("×", a.Shape)}), dtype={(a.IsInt ? "int64" : "float64")})");
+            string Cell(double v) => WebUtility.HtmlEncode(a.IsInt
+                ? ((long)System.Math.Round(v)).ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : PyOps.Str(v));
+            var sb = new StringBuilder();
+            sb.Append("<span class=\"mat\"><span class=\"lb\"></span><span class=\"cells\">");
+            int rows = a.Ndim == 1 ? 1 : a.Rows, cols = a.Ndim == 1 ? a.Size : a.Cols;
+            for (int i = 0; i < rows; i++)
+            {
+                sb.Append("<span class=\"row\">");
+                for (int j = 0; j < cols; j++)
+                    sb.Append("<span class=\"cell\">").Append(Cell(a.Data[i * cols + j])).Append("</span>");
+                sb.Append("</span>");
+            }
+            sb.Append("</span><span class=\"rb\"></span></span>");
             return sb.ToString();
         }
 

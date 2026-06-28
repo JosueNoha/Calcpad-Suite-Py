@@ -821,6 +821,10 @@ namespace Calcpad.Wpf
             plot.SmoothScale = SmoothCheckBox.IsChecked ?? false;
             plot.ColorScale = (PlotSettings.ColorScales)ColorScaleComboBox.SelectedIndex;
             plot.LightDirection = (PlotSettings.LightDirections)LightDirectionComboBox.SelectedIndex;
+
+            // Entorno de Python persistido (selector de environments) → aplica el python.exe
+            // del entorno elegido a RealPython, así los `import numpy` salen de ESE entorno.
+            try { Calcpad.Core.Python.PythonEnvironments.Initialize(); } catch { }
         }
 
         private void ReadRecentFiles()
@@ -4466,6 +4470,241 @@ namespace Calcpad.Wpf
         private void MenuCli_Click(object sender, RoutedEventArgs e)
         {
             Execute(AppInfo.Path + "Cli.exe");
+        }
+
+        // ════════════════════ SELECTOR DE ENTORNOS DE PYTHON ════════════════════
+        //  Igual que VS Code / PyCharm: elige en qué entorno (venv/conda/sistema)
+        //  corren los .py que usan numpy/scipy/matplotlib. La librería sale de ESE
+        //  entorno, no del Python global. La selección se persiste.
+        private readonly List<MenuItem> _dynEnvItems = new();
+
+        private void MenuPython_SubmenuOpened(object sender, RoutedEventArgs e)
+        {
+            // Limpiar los ítems de entorno generados la vez anterior.
+            foreach (var mi in _dynEnvItems) MenuPython.Items.Remove(mi);
+            _dynEnvItems.Clear();
+
+            int insertAt = 0;
+            void Insert(MenuItem mi) { MenuPython.Items.Insert(insertAt++, mi); _dynEnvItems.Add(mi); }
+
+            var active = Calcpad.Core.Python.PythonEnvironments.ActiveInterpreter;
+
+            // Opción por defecto: el "python" del PATH del sistema.
+            var sys = new MenuItem
+            {
+                Header = "Python del sistema (PATH)",
+                IsCheckable = true,
+                IsChecked = string.IsNullOrEmpty(active)
+            };
+            sys.Click += (_, __) =>
+            {
+                Calcpad.Core.Python.PythonEnvironments.Select(null, "Python del sistema (PATH)");
+                ShowEnvBanner();
+            };
+            Insert(sys);
+
+            List<Calcpad.Core.Python.PythonEnv> envs;
+            try { envs = Calcpad.Core.Python.PythonEnvironments.Discover(); }
+            catch { envs = new List<Calcpad.Core.Python.PythonEnv>(); }
+
+            foreach (var env in envs)
+            {
+                var captured = env;
+                var item = new MenuItem
+                {
+                    Header = $"{env.DisplayName}   [{env.Kind}]",
+                    IsCheckable = true,
+                    IsChecked = !string.IsNullOrEmpty(active) &&
+                                string.Equals(Calcpad.Core.Python.PythonEnv.NormExe(active),
+                                              Calcpad.Core.Python.PythonEnv.NormExe(env.PythonExe),
+                                              StringComparison.OrdinalIgnoreCase),
+                    ToolTip = env.PythonExe
+                };
+                item.Click += (_, __) =>
+                {
+                    Calcpad.Core.Python.PythonEnvironments.Select(captured.PythonExe, captured.DisplayName);
+                    ShowEnvBanner();
+                };
+                Insert(item);
+            }
+
+            if (envs.Count == 0)
+            {
+                var none = new MenuItem { Header = "(no se detectaron venv/conda — usá 'Agregar' o 'Crear')", IsEnabled = false };
+                Insert(none);
+            }
+
+            // El ítem placeholder estático sobra cuando ya insertamos los reales.
+            MenuPythonEnvs.Visibility = Visibility.Collapsed;
+        }
+
+        private void ShowEnvBanner()
+        {
+            try
+            {
+                ShowHelp($"Entorno de Python activo: {Calcpad.Core.Python.PythonEnvironments.ActiveLabel}");
+            }
+            catch { }
+        }
+
+        // Compat: si ShowHelp no existe en esta build, mostrar por MessageBox liviano.
+        private void ShowHelp(string msg) =>
+            MessageBox.Show(msg, "Calcpad Suite Py — Python", MessageBoxButton.OK, MessageBoxImage.Information);
+
+        private void MenuPythonAddVenv_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new OpenFolderDialog
+            {
+                Title = "Elegí la carpeta del entorno virtual (la que contiene 'Scripts' y 'pyvenv.cfg')"
+            };
+            if (dlg.ShowDialog() != true) return;
+            var env = Calcpad.Core.Python.PythonEnvironments.AddVenvFolder(dlg.FolderName);
+            if (env == null)
+            {
+                MessageBox.Show(
+                    "Esa carpeta no es un entorno virtual válido.\n\nUn venv contiene un archivo 'pyvenv.cfg' " +
+                    "y un 'Scripts\\python.exe' (en Windows). Elegí la carpeta raíz del venv.",
+                    "Entorno no válido", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            Calcpad.Core.Python.PythonEnvironments.Select(env.PythonExe, env.DisplayName);
+            ShowEnvBanner();
+        }
+
+        private void MenuPythonCreateVenv_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new OpenFolderDialog
+            {
+                Title = "Elegí la carpeta donde crear el entorno nuevo (se usará tal cual; podés crear una nueva en el diálogo)"
+            };
+            if (dlg.ShowDialog() != true) return;
+            var folder = dlg.FolderName;
+
+            var info = new MessageBoxResult();
+            info = MessageBox.Show(
+                $"Se creará un entorno virtual en:\n{folder}\n\n" +
+                "¿Querés además instalar numpy, scipy y matplotlib enseguida? (requiere internet)",
+                "Crear entorno", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+            if (info == MessageBoxResult.Cancel) return;
+            bool installToo = info == MessageBoxResult.Yes;
+
+            RunPythonJobWindow("Creando entorno virtual…", append =>
+            {
+                append($"> python -m venv \"{folder}\"\n");
+                var (ok, msg) = Calcpad.Core.Python.PythonEnvironments.CreateVenv(folder);
+                append(msg + "\n");
+                if (!ok) { append("\n[FALLÓ] ¿Está Python instalado y en el PATH? (es la semilla del venv)\n"); return false; }
+
+                var py = Calcpad.Core.Python.PythonEnvironments.VenvPython(folder);
+                Dispatcher.Invoke(() =>
+                {
+                    Calcpad.Core.Python.PythonEnvironments.Select(py, System.IO.Path.GetFileName(folder));
+                });
+                append($"\nEntorno activo: {folder}\n");
+
+                if (installToo)
+                {
+                    append("\n> pip install numpy scipy matplotlib\n");
+                    var (iok, ierr) = Calcpad.Core.Python.PythonEnvironments.InstallScientificStack(py, l => append(l + "\n"));
+                    if (!iok) { append("\n[pip falló]\n" + ierr + "\n"); return false; }
+                    append("\n[OK] Librerías instaladas en el entorno.\n");
+                }
+                return true;
+            });
+        }
+
+        private void MenuPythonInstall_Click(object sender, RoutedEventArgs e)
+        {
+            var py = Calcpad.Core.Python.PythonEnvironments.ActiveInterpreter
+                     ?? (OperatingSystem.IsWindows() ? "python" : "python3");
+            var label = Calcpad.Core.Python.PythonEnvironments.ActiveLabel;
+            if (MessageBox.Show(
+                    $"Se instalarán / actualizarán numpy, scipy y matplotlib en el entorno:\n\n{label}\n{py}\n\n" +
+                    "(requiere conexión a internet). ¿Continuar?",
+                    "Instalar librerías", MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK)
+                return;
+
+            RunPythonJobWindow("Instalando numpy · scipy · matplotlib…", append =>
+            {
+                append($"> {py} -m pip install --upgrade numpy scipy matplotlib\n\n");
+                var (ok, err) = Calcpad.Core.Python.PythonEnvironments.InstallScientificStack(py, l => append(l + "\n"));
+                if (!ok) { append("\n[FALLÓ]\n" + err + "\n"); return false; }
+                append("\n[OK] Listo. Ya podés correr scripts con numpy en este entorno.\n");
+                return true;
+            });
+        }
+
+        private void MenuPythonCheck_Click(object sender, RoutedEventArgs e)
+        {
+            var py = Calcpad.Core.Python.PythonEnvironments.ActiveInterpreter
+                     ?? (OperatingSystem.IsWindows() ? "python" : "python3");
+            RunPythonJobWindow("Verificando entorno…", append =>
+            {
+                append($"Entorno activo: {Calcpad.Core.Python.PythonEnvironments.ActiveLabel}\n");
+                append($"Intérprete: {py}\n");
+                var ver = Calcpad.Core.Python.PythonEnvironments.Version(py);
+                append("Versión: " + (string.IsNullOrEmpty(ver) ? "(no responde — ¿ruta válida?)" : ver) + "\n\n");
+                if (string.IsNullOrEmpty(ver)) return false;
+                var mods = Calcpad.Core.Python.PythonEnvironments.CheckModules(py);
+                foreach (var kv in mods)
+                    append($"  {(kv.Value ? "✓" : "✗")}  {kv.Key}\n");
+                bool all = mods.Values.All(v => v);
+                append(all
+                    ? "\n[OK] El entorno tiene todo lo necesario.\n"
+                    : "\nFaltan librerías → usá 'Instalar / actualizar numpy · scipy · matplotlib'.\n");
+                return all;
+            });
+        }
+
+        private void MenuPythonOpenFolder_Click(object sender, RoutedEventArgs e)
+        {
+            var py = Calcpad.Core.Python.PythonEnvironments.ActiveInterpreter;
+            if (string.IsNullOrEmpty(py) || !File.Exists(py))
+            {
+                MessageBox.Show("El entorno activo es el Python del PATH (sin carpeta propia), o no se encuentra.",
+                    "Sin carpeta", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            try { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{py}\"") { UseShellExecute = true }); }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error); }
+        }
+
+        /// <summary>Ventana modal sencilla con consola de salida en vivo para tareas de Python
+        /// (crear venv, pip install, verificar). Corre <paramref name="job"/> en background y
+        /// le pasa un callback append(texto) seguro para hilos.</summary>
+        private void RunPythonJobWindow(string title, Func<Action<string>, bool> job)
+        {
+            var box = new System.Windows.Controls.TextBox
+            {
+                IsReadOnly = true, AcceptsReturn = true,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                FontSize = 12, TextWrapping = TextWrapping.NoWrap,
+                Background = System.Windows.Media.Brushes.Black,
+                Foreground = System.Windows.Media.Brushes.Gainsboro
+            };
+            var win = new Window
+            {
+                Title = title, Owner = this, Width = 760, Height = 460,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Content = box
+            };
+
+            void Append(string s) => Dispatcher.Invoke(() =>
+            {
+                box.AppendText(s.Replace("\r\n", "\n"));
+                box.ScrollToEnd();
+            }, System.Windows.Threading.DispatcherPriority.Background);
+
+            win.Loaded += async (_, __) =>
+            {
+                bool ok = false;
+                try { ok = await Task.Run(() => job(Append)); }
+                catch (Exception ex) { Append("\n[EXCEPCIÓN] " + ex.Message + "\n"); }
+                Append(ok ? "\n— Finalizado —\n" : "\n— Finalizado con errores —\n");
+            };
+            win.ShowDialog();
         }
 
         private ExcelViewerWindow _excelViewerWindow;
