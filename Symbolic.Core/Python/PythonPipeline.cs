@@ -620,6 +620,14 @@ try:
     def _cpspy_emit_lines(_fig):
         import matplotlib.colors as _mcol
         _Q = chr(39)
+        # CP2D es SOLO para gráficas de línea x-y. Si la figura es un dibujo de
+        # malla/geometría (polígonos ax.fill→patches, scatter→collections, o aspecto
+        # fijo set_aspect('equal')) NO se convierte → cae a PNG fiel (igual que Python).
+        for _axc in _fig.get_axes():
+            try:
+                if len(_axc.patches) > 0 or len(_axc.collections) > 0: return False
+                if _axc.get_aspect() != 'auto': return False
+            except Exception: pass
         _axes = [ax for ax in _fig.get_axes() if len(ax.get_lines()) > 0]
         if not _axes: return False
         _parts = ['<script>if(!window.CP2D){' + _CP2DJS + '}</script>']

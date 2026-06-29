@@ -11,7 +11,7 @@ system `python` for `numpy` / `scipy` / `matplotlib` / `plotly`.
 > Same renderized HTML/PDF/DOCX output as Calcpad, same auto-run-on-save,
 > same template — only the input syntax is Python.
 
-📥 **Download:** [CalcpadSuitePy-Setup-1.0.8.exe](https://github.com/GiorgioBurbanelli89/Calcpad-Suite-Py/releases) (self-contained, no .NET required)
+📥 **Download:** [CalcpadSuitePy-Setup-1.0.9.exe](https://github.com/GiorgioBurbanelli89/Calcpad-Suite-Py/releases) (self-contained, no .NET required)
 📁 Ejemplos `.py` bundleados con el installer (se copian a `Documents\Calcpad Suite Py\Examples\`).
 
 > ℹ️ El motor MATLAB (`.m`) vive en el proyecto hermano **Calcpad Lab** — ver
@@ -108,7 +108,7 @@ que Calcpad pero con Python.
 
 ## Instalación
 
-1. Descargar **CalcpadSuitePy-Setup-1.0.8.exe** desde los
+1. Descargar **CalcpadSuitePy-Setup-1.0.9.exe** desde los
    [releases del repo](https://github.com/GiorgioBurbanelli89/Calcpad-Suite-Py/releases).
 2. Doble-click → aceptar UAC → seguir el wizard (acepta asociación `.py` para abrir scripts con doble-click).
 3. Al primer arranque, los ejemplos se copian a `Documents\Calcpad Suite Py\Examples\`.
